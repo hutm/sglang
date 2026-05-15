@@ -677,6 +677,7 @@ class ServerArgs:
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
+    defer_cuda_graph_capture: bool = False
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -6149,6 +6150,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dllm_algorithm_config,
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
+        )
+        # Internal DLLM state: set programmatically before CUDA graph capture.
+        # Keep it in the parsed namespace without exposing a CLI flag.
+        parser.set_defaults(
+            defer_cuda_graph_capture=ServerArgs.defer_cuda_graph_capture
         )
 
         # Offloading

@@ -342,7 +342,11 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def _init_model_runner(self):
+        from sglang.srt.dllm.config import should_defer_cuda_graph_capture
         from sglang.srt.model_executor.model_runner import ModelRunner
+
+        if should_defer_cuda_graph_capture(self.server_args):
+            self.server_args.defer_cuda_graph_capture = True
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
@@ -400,6 +404,15 @@ class TpModelWorker(BaseTpWorker):
             # capture hooks before graphs are captured.
             if hasattr(self.dllm_algorithm, "setup"):
                 self.dllm_algorithm.setup(self._model_runner)
+
+            graph_runner = getattr(self._model_runner, "graph_runner", None)
+            if (
+                self.server_args.defer_cuda_graph_capture
+                and graph_runner is not None
+                and not graph_runner.graphs
+            ):
+                logger.info("Capturing deferred CUDA graphs for DLLM.")
+                graph_runner.init_capture()
         else:
             self.dllm_algorithm = None
 

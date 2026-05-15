@@ -700,7 +700,7 @@ class CudaGraphRunner:
 
         # Capture (can be deferred for DLLM dual-weight baking —
         # hooks must be set before the first capture).
-        if not getattr(model_runner.server_args, "_defer_cuda_graph_capture", False):
+        if not model_runner.server_args.defer_cuda_graph_capture:
             self.init_capture()
 
     def init_capture(self):
@@ -1058,8 +1058,10 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        capture_mode = self.capture_forward_mode
+
         forward_batch = ForwardBatch(
-            forward_mode=self.capture_forward_mode,
+            forward_mode=capture_mode,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -1084,7 +1086,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
-            global_forward_mode=self.capture_forward_mode,
+            global_forward_mode=capture_mode,
             lora_ids=lora_ids,
         )
 
@@ -1353,6 +1355,7 @@ class CudaGraphRunner:
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
+                # Standard DLLM (LinearSpec / FastDiffuser): full_logits for all tokens.
                 next_token_logits = None
                 full_logits = (
                     output.full_logits[: self.raw_num_token]
@@ -1360,6 +1363,7 @@ class CudaGraphRunner:
                     else None
                 )
             else:
+                # Standard DECODE: next_token_logits per request.
                 full_logits = None
                 next_token_logits = (
                     output.next_token_logits[: self.raw_num_token]
