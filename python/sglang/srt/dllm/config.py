@@ -4,6 +4,28 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
 
+def load_dllm_algorithm_config(algorithm_config_path: str | None) -> dict[str, Any]:
+    if algorithm_config_path is None:
+        return {}
+
+    try:
+        import yaml
+    except ImportError:
+        raise ImportError(
+            "Please install PyYAML to use YAML config files. " "`pip install pyyaml`"
+        )
+    with open(algorithm_config_path, "r") as f:
+        return yaml.safe_load(f) or {}
+
+
+def should_defer_cuda_graph_capture(server_args: ServerArgs) -> bool:
+    if server_args.dllm_algorithm is None:
+        return False
+
+    algorithm_config = load_dllm_algorithm_config(server_args.dllm_algorithm_config)
+    return bool(algorithm_config.get("lora_path"))
+
+
 class DllmConfig:
     def __init__(
         self,
@@ -55,21 +77,10 @@ class DllmConfig:
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
-        algorithm_config = {}
+        algorithm_config = load_dllm_algorithm_config(server_args.dllm_algorithm_config)
 
-        if server_args.dllm_algorithm_config is not None:
-            try:
-                import yaml
-            except ImportError:
-                raise ImportError(
-                    "Please install PyYAML to use YAML config files. "
-                    "`pip install pyyaml`"
-                )
-            with open(server_args.dllm_algorithm_config, "r") as f:
-                algorithm_config = yaml.safe_load(f) or {}
-
-            # Parse common algorithm configurations
-            block_size = algorithm_config.get("block_size", block_size)
+        # Parse common algorithm configurations
+        block_size = algorithm_config.get("block_size", block_size)
 
         max_steps = algorithm_config.get("max_steps", block_size)
 

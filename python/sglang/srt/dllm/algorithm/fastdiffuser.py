@@ -120,19 +120,12 @@ class FastDiffuser(DllmAlgorithm):
         # specified; can be overridden via dllm_algorithm_config.max_steps)
         self.max_steps: int = config.max_steps
         self.causal_context: bool = config.causal_context
-        # Fixed token budget per denoising step (disabled by default).
-        # When set, overrides threshold/schedule and commits exactly this many
-        # tokens per step (capped at remaining masked tokens).  Useful for
-        # measuring throughput at different token-commit rates.
-        self.tokens_per_step: Optional[int] = cfg.get("tokens_per_step", None)
 
         # EOS token id — read lazily from the hf_config if available
         self._eos_token_id: Optional[int] = None
 
-        # Efficiency counters (written to _STATS_FILE on every update so the
-        # benchmark client can poll without any API changes).
+        # Efficiency counters
         self._stats_forward_passes: int = 0  # total model_runner.forward() calls
-        self._stats_tokens_generated: int = 0  # total output tokens committed
         self._stats_cuda_graph: int = 0  # forward passes that used CUDA graph
         self._stats_eager: int = 0  # forward passes that used eager mode
         self._stats_file: Optional[str] = cfg.get("stats_file", None)
@@ -149,22 +142,6 @@ class FastDiffuser(DllmAlgorithm):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _flush_stats(self) -> None:
-        """Atomically write efficiency counters to the stats file (if configured)."""
-        if not self._stats_file:
-            return
-        import json
-        import os
-
-        data = {
-            "forward_passes": self._stats_forward_passes,
-            "tokens_generated": self._stats_tokens_generated,
-        }
-        tmp = self._stats_file + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, self._stats_file)
 
     def _get_eos_id(self, model_runner: ModelRunner) -> Optional[int]:
         """Return EOS token id, cached after first call."""
@@ -516,7 +493,6 @@ class FastDiffuser(DllmAlgorithm):
                     # directly comparable.
                     fp = req_steps_active[b]
                     tokens = int(next_token_ids_list[b].shape[0])
-                    self._stats_tokens_generated += tokens
                     tpfp = tokens / fp if fp > 0 else 0.0
                     _sf.write(
                         _json.dumps(
@@ -528,8 +504,6 @@ class FastDiffuser(DllmAlgorithm):
                         )
                         + "\n"
                     )
-            # Note: do NOT call _flush_stats() here — it overwrites the JSONL file.
-            # _flush_stats() is for external polling of aggregate counters only.
 
         logger.debug(
             "FastDiffuser block done: CG=%d  eager=%d  total_fp=%d",

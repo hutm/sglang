@@ -342,7 +342,11 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def _init_model_runner(self):
+        from sglang.srt.dllm.config import should_defer_cuda_graph_capture
         from sglang.srt.model_executor.model_runner import ModelRunner
+
+        if should_defer_cuda_graph_capture(self.server_args):
+            self.server_args.defer_cuda_graph_capture = True
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
