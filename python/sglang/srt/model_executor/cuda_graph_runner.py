@@ -568,6 +568,10 @@ def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
     return key
 
 
+def _default_make_dllm_causal_graph_key(graph_key):
+    return f"causal_{graph_key}"
+
+
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -619,6 +623,8 @@ class CudaGraphRunner:
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
         self.dllm_causal = False
+        self.replay_stream_idx = None
+        self.replay_variant_label = None
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
@@ -749,6 +755,21 @@ class CudaGraphRunner:
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         """Build a graph dict key from batch size, stream index, and lora variant."""
         return _default_make_graph_key(bs, stream_idx, variant_label)
+
+    def _make_dllm_causal_graph_key(self, graph_key):
+        return _default_make_dllm_causal_graph_key(graph_key)
+
+    def get_replay_graph_key(self, causal: bool = False):
+        # Fast path: in the common case (no pdmux, no LoRA variant labelling)
+        # the graph key is just `bs`. Avoid the helper dispatch chain so the
+        # LinearSpec replay loop stays cheap.
+        bs = self.bs
+        if self.replay_stream_idx is None and self.replay_variant_label is None:
+            return f"causal_{bs}" if causal else bs
+        graph_key = _default_make_graph_key(
+            bs, self.replay_stream_idx, self.replay_variant_label
+        )
+        return f"causal_{graph_key}" if causal else graph_key
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         """Return the variant label for the given batch, or None if dual backends are off."""
@@ -918,7 +939,7 @@ class CudaGraphRunner:
 
                         # DLLM: capture a second graph with causal=True for the
                         # KV-update pass (1 per block, ~3% of forward passes).
-                        if self.is_dllm:
+                        if getattr(self, "is_dllm", False):
                             # Hook: swap to base/verify weights before causal capture
                             pre_verify = getattr(self, "_dllm_pre_verify_hook", None)
                             if pre_verify:
@@ -926,11 +947,7 @@ class CudaGraphRunner:
                             causal_graph, causal_output = self.capture_one_batch_size(
                                 bs, forward, stream_idx, dllm_causal=True
                             )
-                            causal_key = (
-                                f"causal_{bs}"
-                                if stream_idx is None
-                                else f"causal_{stream_idx}_{bs}"
-                            )
+                            causal_key = _default_make_dllm_causal_graph_key(key)
                             self.graphs[causal_key] = causal_graph
                             self.output_buffers[causal_key] = causal_output
 
@@ -1329,6 +1346,7 @@ class CudaGraphRunner:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
+            stream_idx = None
             attn_backend = self.attn_backend
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
@@ -1355,6 +1373,8 @@ class CudaGraphRunner:
         self.raw_num_token = raw_num_token
         self.bs = bs
         self.dllm_causal = dllm_causal
+        self.replay_stream_idx = stream_idx
+        self.replay_variant_label = self._resolve_lora_variant(forward_batch)
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1383,11 +1403,9 @@ class CudaGraphRunner:
                 )
 
         # Replay
-        variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
-        if self.dllm_causal:
-            graph_key = f"causal_{graph_key}"
+        self.replay_stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        self.replay_variant_label = self._resolve_lora_variant(forward_batch)
+        graph_key = self.get_replay_graph_key(causal=self.dllm_causal)
         ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={
