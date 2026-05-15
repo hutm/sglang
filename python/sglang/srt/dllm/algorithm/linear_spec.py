@@ -75,6 +75,11 @@ class LinearSpec(DllmAlgorithm):
         # The module ref is needed for FP8 mode to access weight_scale.
         self._lora_path: Optional[str] = cfg.get("lora_path", None)
         self._lora_mode: str = cfg.get("lora_mode", "draft_only")
+        if self._lora_mode not in ("draft_only", "both"):
+            raise ValueError(
+                "LinearSpec lora_mode must be 'draft_only' or 'both', "
+                f"got {self._lora_mode!r}."
+            )
         self._lora_deltas: Optional[
             List[Tuple[torch.nn.Parameter, torch.Tensor, torch.nn.Module]]
         ] = None
@@ -131,36 +136,47 @@ class LinearSpec(DllmAlgorithm):
         optionally bake dual weights into CUDA graphs."""
         if self._lora_path is None:
             return
+
         self._load_lora_deltas(model_runner)
-        if self._lora_deltas and model_runner.graph_runner is not None:
-            if self._lora_mode == "both":
-                # Permanently apply LoRA IN-PLACE to original model weight
-                # memory before CUDA graph capture. Graphs record original HBM
-                # addresses — same cache behavior as base weights. Avoids
-                # allocating new d=b+Δ tensors (which have different HBM
-                # addresses → ~3ms/block penalty vs original allocation).
-                for param, delta, _mod in self._lora_deltas:
-                    param.data.add_(delta)
-                lora_mb = (
-                    sum(d.numel() * d.element_size() for _, d, _ in self._lora_deltas)
-                    / 1e6
-                )
+        graph_runner = model_runner.graph_runner
+        if graph_runner is None:
+            return
+
+        if not self._lora_deltas:
+            logger.warning(
+                "LinearSpec LoRA path %s did not produce any supported deltas; "
+                "continuing with base weights.",
+                self._lora_path,
+            )
+            self._graphs_baked = True
+            self._lora_deltas = None
+            return
+
+        if self._lora_mode == "both":
+            # Permanently apply LoRA IN-PLACE to original model weight memory.
+            # Existing and future CUDA graphs read the same HBM addresses, so
+            # updating values in-place is enough for both eager and graph paths.
+            for param, delta, _mod in self._lora_deltas:
+                param.data.add_(delta)
+            lora_mb = (
+                sum(d.numel() * d.element_size() for _, d, _ in self._lora_deltas) / 1e6
+            )
+            logger.info(
+                "LinearSpec: applied %.1f MB LoRA in-place to base weights "
+                "(permanent, both-mode)",
+                lora_mb,
+            )
+            if model_runner.server_args.defer_cuda_graph_capture:
                 logger.info(
-                    "LinearSpec: applied %.1f MB LoRA in-place to base weights "
-                    "(permanent, both-mode)",
-                    lora_mb,
+                    "LinearSpec: capturing CUDA graphs with permanent in-place LoRA..."
                 )
-                gr = model_runner.graph_runner
-                if model_runner.server_args.defer_cuda_graph_capture:
-                    logger.info(
-                        "LinearSpec: capturing CUDA graphs with permanent in-place LoRA..."
-                    )
-                    gr.init_capture()
-                    self._graphs_baked = True
-                    self._lora_deltas = None
-                    logger.info("LinearSpec: CUDA graph capture done (in-place LoRA)")
-            else:
-                self._bake_dual_weights_into_graphs(model_runner)
+                graph_runner.init_capture()
+                logger.info("LinearSpec: CUDA graph capture done (in-place LoRA)")
+            self._graphs_baked = True
+            self._lora_deltas = None
+            return
+
+        self._bake_dual_weights_into_graphs(model_runner)
 
     def _bake_dual_weights_into_graphs(self, model_runner: ModelRunner) -> None:
         """Build draft weight copies from LoRA deltas, set CUDA graph hooks,
@@ -323,7 +339,11 @@ class LinearSpec(DllmAlgorithm):
                 self._torch_profile_steps = 0  # disable further capture
 
         batch_size = forward_batch.batch_size
-        bs = self.block_size
+        # Per-block block_size: scheduler may have set it for tier policy,
+        # otherwise fall back to the static config.
+        bs = forward_batch.dllm_block_size
+        if bs is None:
+            bs = self.block_size
         eos_id = self._get_eos_id(model_runner)
 
         # ----------------------------------------------------------------

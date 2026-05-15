@@ -1612,6 +1612,10 @@ class ScheduleBatch(ScheduleBatchDllmMixin, ScheduleBatchDisaggregationDecodeMix
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    # Active block_size for the current pending block (LinearSpec dynamic-tier
+    # mode). Set by the scheduler before block dispatch. None → fall back to
+    # dllm_config.block_size at consumers (static-config path).
+    dllm_block_size: Optional[int] = None
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
