@@ -530,6 +530,10 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
+def _default_make_dllm_causal_graph_key(graph_key):
+    return f"causal_{graph_key}"
+
+
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -588,6 +592,7 @@ class CudaGraphRunner:
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
         self.dllm_causal = False
+        self.replay_stream_idx = None
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
@@ -722,6 +727,16 @@ class CudaGraphRunner:
 
     def _cache_loc_dtype(self):
         return torch.int64
+
+    def get_replay_graph_key(self, causal: bool = False):
+        # Fast path: in the common case (no pdmux), the graph key is just
+        # `bs`. Avoid the helper dispatch chain so the
+        # LinearSpec replay loop stays cheap.
+        bs = self.bs
+        graph_key = (
+            bs if self.replay_stream_idx is None else f"{self.replay_stream_idx}_{bs}"
+        )
+        return f"causal_{graph_key}" if causal else graph_key
 
     def can_run(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
@@ -877,11 +892,7 @@ class CudaGraphRunner:
                         causal_graph, causal_output = self.capture_one_batch_size(
                             bs, forward, stream_idx, dllm_causal=True
                         )
-                        causal_key = (
-                            f"causal_{bs}"
-                            if stream_idx is None
-                            else f"causal_{stream_idx}_{bs}"
-                        )
+                        causal_key = _default_make_dllm_causal_graph_key(key)
                         self.graphs[causal_key] = causal_graph
                         self.output_buffers[causal_key] = causal_output
 
@@ -1279,6 +1290,7 @@ class CudaGraphRunner:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
+            stream_idx = None
             attn_backend = self.attn_backend
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
@@ -1305,6 +1317,7 @@ class CudaGraphRunner:
         self.raw_num_token = raw_num_token
         self.bs = bs
         self.dllm_causal = dllm_causal
+        self.replay_stream_idx = stream_idx
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1333,12 +1346,8 @@ class CudaGraphRunner:
                 )
 
         # Replay
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
-        else:
-            graph_key = self.bs
-        if self.dllm_causal:
-            graph_key = f"causal_{graph_key}"
+        self.replay_stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        graph_key = self.get_replay_graph_key(causal=self.dllm_causal)
         ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={

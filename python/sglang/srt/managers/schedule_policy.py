@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.schedule_policy import PrefillAdderDllmMixin
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -402,7 +403,7 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
-class PrefillAdder:
+class PrefillAdder(PrefillAdderDllmMixin):
     def __init__(
         self,
         page_size: int,
@@ -624,33 +625,6 @@ class PrefillAdder:
         self.can_run_list.append(req)
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
-
-    def add_dllm_prompt_cache_req(self, req: Req) -> AddReqResult:
-        """Add an INCOMING_PREFILL request using standard prefill budget.
-
-        Schedules the full prompt as a regular EXTEND pass (no mask tokens, no
-        DLLM block budget).  Used to cache prompt KV before denoising begins.
-        """
-        total_tokens = req.extend_input_len + min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
-
-        if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
-
-        input_tokens = self.ceil_paged_tokens(req.extend_input_len)
-
-        if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-            return AddReqResult.OTHER
-
-        self.can_run_list.append(req)
-        self._update_prefill_budget(
-            len(req.prefix_indices),
-            input_tokens,
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
-        )
-        return AddReqResult.CONTINUE
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)

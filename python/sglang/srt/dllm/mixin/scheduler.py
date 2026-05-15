@@ -10,9 +10,11 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,37 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
+        # Pinned-host + device tensor buffers reused across DLLM_EXTEND
+        # blocks (and SamplingBatchInfo cached for stable batch composition).
+        # The ScheduleBatch object itself is NOT reused: its reqs list is
+        # mutated by the scheduler's merge logic between iterations
+        # (DLLM_EXTEND.is_extend() == True triggers
+        # last_batch.filter_batch(...)). Buffers live here so they survive.
+        self._dllm_block_buffers: Optional[dict] = None
+        self._dllm_cached_sampling_info = None
+        self._dllm_cached_sampling_info_reqs_id: Optional[int] = None
+        # Optional optimization: run K extra DLLM_EXTEND blocks per
+        # event-loop iteration, reusing the same batch object and bypassing
+        # the scheduler's recv / new-batch-build / merge code per inner
+        # block. Falls back to K=1 behavior on any state change (new
+        # request arrives, a req finishes, batch_size != 1, etc.) so
+        # multi-request workloads are unaffected.
+        #
+        # Default K=1 (no inner loop). Latency-bound single-request
+        # workloads can set inner_k_blocks=4 in the YAML to amortize the
+        # outside-run_batch scheduler overhead across K inner blocks.
+        # Empirically K=4 saturates the amortization win; higher K shows
+        # diminishing or slightly negative returns from EOS overshoot on
+        # short responses.
+        self._dllm_inner_k_blocks = (
+            self.dllm_config.algorithm_config.get("inner_k_blocks", 1)
+            if self.dllm_config is not None
+            else 1
+        )
+        # Counter for throttled per-iter prefill stats reporting in
+        # process_batch_result_dllm. Initialized to 0 here so the first
+        # iteration starts a fresh window of 20 blocks.
+        self._dllm_stats_skip_count = 0
         # Fine-grained DLLM scheduler profiling
         self._dllm_sched_prof = (
             self.dllm_config is not None
@@ -74,6 +107,13 @@ class SchedulerDllmMixin:
             self._dsp_prepare = 0.0
             self._dsp_process = 0.0
             self._dsp_create = 0.0
+            # _create_dllm_batch sub-timings
+            self._dsp_init_new = 0.0
+            self._dsp_prep_extend = 0.0
+            self._dsp_stats_build = 0.0
+            # SamplingBatchInfo cache reuse counters
+            self._dsp_a2_sampling_hits = 0
+            self._dsp_a2_sampling_misses = 0
 
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Build the next DLLM batch (EXTEND for prompt caching or DLLM_EXTEND for denoising)."""
@@ -120,10 +160,16 @@ class SchedulerDllmMixin:
             self._dsp_n += 1
             if self._dsp_n % 500 == 0:
                 n = self._dsp_n
+                a2_total = self._dsp_a2_sampling_hits + self._dsp_a2_sampling_misses
+                a2_hit_rate = (
+                    self._dsp_a2_sampling_hits / a2_total * 100 if a2_total > 0 else 0
+                )
                 logger.info(
                     "DLLM SCHED PROFILE (%d iters): "
                     "process_result[sync=%.2f tolist+kv=%.2f stream=%.2f stats=%.2f]ms  "
-                    "get_batch[prepare=%.2f process=%.2f create=%.2f]ms",
+                    "get_batch[prepare=%.2f process=%.2f create=%.2f"
+                    " (init_new=%.3f prep_extend=%.3f stats_build=%.3f)]ms  "
+                    "A2_sampling_cache[hits=%d misses=%d rate=%.1f%%]",
                     n,
                     self._dsp_sync / n * 1000,
                     self._dsp_tolist / n * 1000,
@@ -132,6 +178,12 @@ class SchedulerDllmMixin:
                     self._dsp_prepare / n * 1000,
                     self._dsp_process / n * 1000,
                     self._dsp_create / n * 1000,
+                    self._dsp_init_new / n * 1000,
+                    self._dsp_prep_extend / n * 1000,
+                    self._dsp_stats_build / n * 1000,
+                    self._dsp_a2_sampling_hits,
+                    self._dsp_a2_sampling_misses,
+                    a2_hit_rate,
                 )
 
         return batch
@@ -154,7 +206,7 @@ class SchedulerDllmMixin:
         if not batch.forward_mode.is_dllm_extend():
             for req in batch.reqs:
                 req.fill_ids = []
-            self.report_prefill_stats(
+            self.metrics_reporter.report_prefill_stats(
                 batch=batch,
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=False,
@@ -214,20 +266,42 @@ class SchedulerDllmMixin:
             if _prof:
                 _pt2 = self._dllm_time.perf_counter()
 
-            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+            # Skip stream_output entirely when no req is finished and no
+            # req has stream=True. Non-streaming completions only need their
+            # output sent on completion; streaming clients still trigger it
+            # every block (gated by stream_interval inside stream_output).
+            need_stream = any(
+                r.finished() or getattr(r, "stream", False) for r in batch.reqs
+            )
+            if need_stream:
+                self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
 
             if _prof:
                 _pt3 = self._dllm_time.perf_counter()
 
             self.token_to_kv_pool_allocator.free_group_end()
 
-        can_run_cuda_graph = result.can_run_cuda_graph
-        self.metrics_reporter.report_prefill_stats(
-            batch=batch,
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        should_report_stats = True
+        # Throttle logging-only prefill stats to every N=20 DLLM_EXTEND blocks.
+        # report_prefill_stats also updates metrics, so keep the every-block
+        # path when metrics collection is enabled.
+        if (
+            batch.forward_mode.is_dllm_extend()
+            and not self.metrics_reporter.current_scheduler_metrics_enabled
+        ):
+            self._dllm_stats_skip_count += 1
+            should_report_stats = self._dllm_stats_skip_count >= 20
+            if should_report_stats:
+                self._dllm_stats_skip_count = 0
+
+        if should_report_stats:
+            self.metrics_reporter.report_prefill_stats(
+                batch=batch,
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
         if _prof and batch.forward_mode.is_dllm_extend():
             _pt4 = self._dllm_time.perf_counter()
@@ -235,6 +309,66 @@ class SchedulerDllmMixin:
             self._dsp_tolist += _pt2 - _pt1
             self._dsp_stream += _pt3 - _pt2
             self._dsp_stats += _pt4 - _pt3
+
+    def maybe_run_dllm_inner_loop(self: Scheduler, batch: ScheduleBatch) -> None:
+        inner_k = getattr(self, "_dllm_inner_k_blocks", 1)
+        if (
+            inner_k > 1
+            and self.dllm_config is not None
+            and batch.forward_mode == ForwardMode.DLLM_EXTEND
+            and batch.batch_size() == 1
+            and not batch.reqs[0].finished()
+            and not self.waiting_queue
+            and len(self.dllm_manager.waiting_queue) == 1
+        ):
+            self._dllm_run_inner_k_blocks(batch, inner_k - 1)
+
+    def _dllm_run_inner_k_blocks(self: Scheduler, batch: ScheduleBatch, k: int) -> None:
+        """Run up to k additional DLLM_EXTEND blocks reusing the same batch
+        object, bypassing the scheduler's recv / new-batch-build /
+        last_batch-merge code for each inner block.
+
+        Caller must guarantee (validated below):
+        - batch.forward_mode == DLLM_EXTEND
+        - batch.batch_size() == 1
+        - the single req is not finished
+        - no new requests are pending
+        - no other reqs are in the dllm waiting queue
+
+        Falls out early if the req finishes during the inner loop.
+        """
+        if not batch.forward_mode.is_dllm_extend() or batch.batch_size() != 1:
+            raise RuntimeError(
+                "_dllm_run_inner_k_blocks called with invalid batch state: "
+                f"forward_mode={batch.forward_mode}, "
+                f"batch_size={batch.batch_size()}"
+            )
+        req = batch.reqs[0]
+        for _ in range(k):
+            # Re-prepare the running req for the next block (mirror of the
+            # work _prepare_staging_reqs does, but for a single in-flight
+            # req — no queue dance).
+            req.init_next_round_input()
+            if req.req_pool_idx is not None and req.kv_committed_len > 0:
+                kv_len = req.kv_committed_len
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :kv_len
+                ].to(torch.int64)
+                req.determine_dllm_phase()
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+
+            # Refresh the per-block tensor state on the existing batch
+            # using the fast path (reuses pinned host + device buffers).
+            batch.prepare_for_dllm_block_extend(buffers=self._dllm_block_buffers)
+            self._dllm_block_buffers = getattr(batch, "_dllm_block_buffers", None)
+            batch.forward_mode = ForwardMode.DLLM_EXTEND
+            batch.decoding_reqs = None
+
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+
+            if req.finished():
+                break
 
     def _prepare_staging_reqs(self: Scheduler) -> None:
         """Rebuild fill_ids and set prefix_indices for the next scheduling round.
@@ -399,6 +533,10 @@ class SchedulerDllmMixin:
     def _create_dllm_batch(
         self: Scheduler, can_run_list: List[Req], forward_mode: ForwardMode
     ) -> ScheduleBatch:
+        _prof = self._dllm_sched_prof
+        if _prof:
+            _ct0 = self._dllm_time.perf_counter()
+
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -409,20 +547,67 @@ class SchedulerDllmMixin:
             self.spec_algorithm,
             dllm_config=self.dllm_config,
         )
-        new_batch.prepare_for_extend()
+
+        if _prof:
+            _ct1 = self._dllm_time.perf_counter()
+
+        # Fast path (A2): for DLLM_EXTEND blocks, use the trimmed
+        # prepare_for_dllm_block_extend that skips multimodal / embeds /
+        # mamba / logprob / MIS branches (unused in the DLLM_EXTEND fast path)
+        # and reuses pinned host + device buffers across blocks.
+        # SamplingBatchInfo is also cached: it depends only on req sampling
+        # params which don't change between blocks of the same request.
+        if forward_mode == ForwardMode.DLLM_EXTEND:
+            new_batch.prepare_for_dllm_block_extend(
+                buffers=self._dllm_block_buffers,
+            )
+            # Save the (possibly newly allocated) buffer dict back so the
+            # next block can reuse it.
+            self._dllm_block_buffers = getattr(new_batch, "_dllm_block_buffers", None)
+
+            # Reuse SamplingBatchInfo when reqs are identity-stable; rebuild
+            # otherwise. id() of the reqs list is unique per call but list
+            # contents are identity-stable for stable batches.
+            reqs_signature = tuple(id(r) for r in can_run_list)
+            if (
+                self._dllm_cached_sampling_info is not None
+                and self._dllm_cached_sampling_info_reqs_id == reqs_signature
+            ):
+                new_batch.sampling_info = self._dllm_cached_sampling_info
+                penalizer_orchestrator = new_batch.sampling_info.penalizer_orchestrator
+                if penalizer_orchestrator is not None:
+                    penalizer_orchestrator.batch = new_batch
+                if _prof:
+                    self._dsp_a2_sampling_hits += 1
+            else:
+                new_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                    new_batch,
+                    self.model_config.vocab_size,
+                )
+                self._dllm_cached_sampling_info = new_batch.sampling_info
+                self._dllm_cached_sampling_info_reqs_id = reqs_signature
+                if _prof:
+                    self._dsp_a2_sampling_misses += 1
+        else:
+            new_batch.prepare_for_extend()
+
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 
-        # Record prefill stats for logging after forward
-        from sglang.srt.managers.scheduler_components.metrics_reporter import (
-            PrefillStats,
-        )
+        if _prof:
+            _ct2 = self._dllm_time.perf_counter()
 
         new_batch.prefill_stats = PrefillStats.from_adder(
             self.adder,
             self.running_batch.reqs,
             getattr(self, "enable_priority_scheduling", False),
         )
+
+        if _prof:
+            _ct3 = self._dllm_time.perf_counter()
+            self._dsp_init_new += _ct1 - _ct0
+            self._dsp_prep_extend += _ct2 - _ct1
+            self._dsp_stats_build += _ct3 - _ct2
 
         return new_batch
 
