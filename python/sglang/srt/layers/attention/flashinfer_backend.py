@@ -859,7 +859,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 layer,
                 forward_batch,
                 self.dllm_config,
-                default_causal=not layer.is_cross_attention,
+                default_causal=(
+                    not layer.is_cross_attention
+                    and layer.attn_type != AttentionType.ENCODER_ONLY
+                ),
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -922,11 +925,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
-                if not self.is_dllm_model:
-                    # TODO: design a better interface
-                    # For other models, use causal attention for the ragged part as previously
-                    causal = True
-
                 # Disable PDL for DLLM_EXTEND to avoid cudaErrorIllegalInstruction
                 # during CUDA graph replay on B200/SM10.0 (Blackwell). PDL uses
                 # cudaLaunchKernelEx with cudaLaunchAttributeProgrammaticStreamSerialization

@@ -2723,12 +2723,15 @@ class ServerArgs:
             )
 
         # DLLM (diffusion LLM) requires bidirectional attention for block denoising.
-        # Only the flashinfer backend supports the required ENCODER_ONLY attention mode.
-        if self.dllm_algorithm is not None and self.attention_backend != "flashinfer":
+        # flashinfer and fa4 both support the required ENCODER_ONLY attention mode.
+        if self.dllm_algorithm is not None and self.attention_backend not in (
+            "flashinfer",
+            "fa4",
+        ):
             raise ValueError(
-                f"DLLM requires the flashinfer attention backend for bidirectional "
+                f"DLLM requires the flashinfer or fa4 attention backend for bidirectional "
                 f"attention, but got '{self.attention_backend}'. Please set "
-                f"--attention-backend flashinfer."
+                f"--attention-backend flashinfer or --attention-backend fa4."
             )
 
         # Torch native and flex attention backends
@@ -4137,9 +4140,12 @@ class ServerArgs:
                 )
                 self.attention_backend = "ascend"
         elif not self.disable_cuda_graph:
-            if self.attention_backend != "flashinfer":
+            if self.attention_backend not in ("flashinfer", "fa4"):
                 logger.warning(
-                    "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+                    "Attention backend must be 'flashinfer' or 'fa4' for "
+                    "diffusion LLM inference with CUDA graph; overriding "
+                    "%s -> flashinfer.",
+                    self.attention_backend,
                 )
                 self.attention_backend = "flashinfer"
         if not self.disable_overlap_schedule:
