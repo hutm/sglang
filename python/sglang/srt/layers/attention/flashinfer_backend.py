@@ -716,7 +716,13 @@ class FlashInferAttnBackend(AttentionBackend):
             # overflow the FlashInfer 384MB workspace buffer for bs >= 4 → "illegal
             # instruction" crash. 8192 keeps KV index entries manageable (bs × 8192)
             # while still ensuring full grid coverage at replay.
-            block_size = self.dllm_config.block_size
+            # Per-graph block_size: derive from num_tokens passed by the runner so
+            # tier-aware capture (block_size_tiers) bakes the right qo geometry.
+            block_size = (
+                max(1, num_tokens // bs)
+                if num_tokens and bs
+                else self.dllm_config.block_size
+            )
             max_pool_len = self.indices_updater_prefill.req_to_token.shape[1]
             _GRID_SATURATION_PREFIX = 8192
             capture_prefix_len = min(_GRID_SATURATION_PREFIX, max_pool_len - block_size)
@@ -752,7 +758,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 # at both capture and replay → no workspace mismatch.
                 disable_split_kv=True,
             )
-            metadata_key = f"causal_{bs}" if dllm_causal else bs
+            # Key by (bs, block_size, causal) so distinct tier block_sizes don't collide.
+            metadata_key = (
+                f"causal_{bs}_bs{block_size}" if dllm_causal else f"{bs}_bs{block_size}"
+            )
             self.prefill_cuda_graph_metadata[metadata_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
@@ -769,6 +778,7 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         dllm_causal: bool = False,
+        **kwargs,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -807,13 +817,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
-            metadata_key = f"causal_{bs}" if dllm_causal else bs
+            # Read tier-aware dllm_block_size from kwargs (set by the runner from
+            # forward_batch.dllm_block_size). Fall back to static config.
+            block_size = kwargs.get("dllm_block_size") or self.dllm_config.block_size
+            metadata_key = (
+                f"causal_{bs}_bs{block_size}" if dllm_causal else f"{bs}_bs{block_size}"
+            )
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=seq_lens - block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,

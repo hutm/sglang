@@ -651,11 +651,26 @@ class CudaGraphRunner:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
+        # per-bs num_tokens_per_bs map. With block_size_tiers, each
+        # cuda_graph_bs is captured with its tier-assigned block_size.
+        self._dllm_tiers = (
+            getattr(self.dllm_config, "block_size_tiers", None)
+            if self.is_dllm
+            else None
+        )
+
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+        if self._dllm_tiers:
+            tiered = ", ".join(
+                f"{bs}->{self._num_tokens_for(bs)}" for bs in self.capture_bs
+            )
+            log_info_on_rank0(
+                logger, f"DLLM block_size_tiers active: bs->block_size: {tiered}"
+            )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -665,7 +680,11 @@ class CudaGraphRunner:
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        # Buffer sized to the worst (bs * num_tokens_per_bs) across captured pairs.
+        # Without tiers this equals max_bs * static block_size (today's behavior).
+        self.max_num_token = max(
+            bs * self._num_tokens_for(bs) for bs in self.capture_bs
+        )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -771,6 +790,16 @@ class CudaGraphRunner:
         )
         return f"causal_{graph_key}" if causal else graph_key
 
+    def _num_tokens_for(self, bs: int) -> int:
+        """num_tokens_per_bs for this cuda_graph_bs.
+
+        With DLLM block_size_tiers, each cuda_graph_bs is assigned a
+        tier-specific block_size; otherwise the runner-wide constant.
+        """
+        if self._dllm_tiers:
+            return int(self.dllm_config.select_block_size(bs))
+        return self.num_tokens_per_bs
+
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         """Return the variant label for the given batch, or None if dual backends are off."""
         if not getattr(self, "record_nolora_graph", False):
@@ -801,6 +830,23 @@ class CudaGraphRunner:
             )
         else:
             cuda_graph_bs = forward_batch.batch_size
+
+        # With DLLM block_size_tiers, each captured graph is keyed by the
+        # padded cuda_graph_bs. The scheduler stamps the raw runtime block
+        # size, so compare it to the block size for the graph we would replay.
+        if (
+            self.is_dllm
+            and self._dllm_tiers
+            and forward_batch.dllm_block_size is not None
+        ):
+            target_bs = cuda_graph_bs
+            if not self.disable_padding:
+                index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
+                if index == len(self.capture_bs):
+                    return False
+                target_bs = self.capture_bs[index]
+            if forward_batch.dllm_block_size != self._num_tokens_for(target_bs):
+                return False
 
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
@@ -922,7 +968,7 @@ class CudaGraphRunner:
                     with patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
+                        num_tokens=bs * self._num_tokens_for(bs),
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
                         # Hook: swap to draft/fused weights before non-causal capture
@@ -1024,7 +1070,7 @@ class CudaGraphRunner:
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
-        num_tokens = bs * self.num_tokens_per_bs
+        num_tokens = bs * self._num_tokens_for(bs)
 
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
@@ -1172,6 +1218,12 @@ class CudaGraphRunner:
         if dllm_causal:
             forward_batch.dllm_causal_kv_update = True
 
+        # stamp the per-graph dllm_block_size so model code (e.g.
+        # LinearSpec.run, ForwardBatch.init_new positions builder) reads the
+        # tier-selected block_size during capture, matching the buffer sizes.
+        if self.is_dllm:
+            forward_batch.dllm_block_size = self._num_tokens_for(bs)
+
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
@@ -1295,13 +1347,20 @@ class CudaGraphRunner:
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        # per-bs num_tokens_per_bs. Use the value the scheduler stamped
+        # on the forward_batch (matches the captured graph for raw_bs's tier).
+        ntpb = (
+            forward_batch.dllm_block_size
+            if (self._dllm_tiers and forward_batch.dllm_block_size is not None)
+            else self.num_tokens_per_bs
+        )
+        raw_num_token = raw_bs * ntpb
 
         # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
+                max_num_tokens / ntpb
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
@@ -1319,7 +1378,7 @@ class CudaGraphRunner:
             bs=bs,
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
-            num_tokens_per_bs=self.num_tokens_per_bs,
+            num_tokens_per_bs=ntpb,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
@@ -1355,6 +1414,13 @@ class CudaGraphRunner:
         replay_kwargs = {}
         if dllm_causal:
             replay_kwargs["dllm_causal"] = True
+        # pass per-block block_size so the attention backend selects
+        # the captured metadata keyed by (bs, block_size).
+        if (
+            self._dllm_tiers
+            and getattr(forward_batch, "dllm_block_size", None) is not None
+        ):
+            replay_kwargs["dllm_block_size"] = int(forward_batch.dllm_block_size)
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],

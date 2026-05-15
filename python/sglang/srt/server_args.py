@@ -4337,6 +4337,9 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
+        from sglang.srt.dllm.config import DllmConfig
+
+        config = DllmConfig.from_server_args(self)
         # On AMD/HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
             if not self.disable_cuda_graph:
@@ -4364,6 +4367,13 @@ class ServerArgs:
                     self.attention_backend,
                 )
                 self.attention_backend = "flashinfer"
+            if self.attention_backend == "fa4" and config.block_size_tiers:
+                raise ValueError(
+                    "DLLM block_size_tiers are currently supported only with "
+                    "the flashinfer attention backend. Please use "
+                    "--attention-backend flashinfer or remove block_size_tiers "
+                    "from the DLLM config."
+                )
         if not self.disable_overlap_schedule:
             logger.warning(
                 "Overlap schedule is disabled because of using diffusion LLM inference"
@@ -4371,9 +4381,6 @@ class ServerArgs:
             self.disable_overlap_schedule = True
 
         if not self.disable_radix_cache:
-            from sglang.srt.dllm.config import DllmConfig
-
-            config = DllmConfig.from_server_args(self)
             # LinearSpec uses partial block acceptance, so it frees
             # individual slots within a page.  PagedTokenToKVPoolAllocator
             # frees ENTIRE pages when any slot is freed, which corrupts

@@ -342,8 +342,14 @@ class RotaryEmbedding(MultiPlatformOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
-            q_rope = query.view(batch_size, -1, self.head_size)
-            k_rope = key.view(batch_size, -1, self.head_size)
+            # `.reshape()` instead of `.view()`: contiguous query/key (the
+            # common AR path) get the same view-without-copy fast path;
+            # non-contiguous slices that arise from multi-shape CUDA-graph
+            # capture buffers (DLLM dynamic block_size mode) gracefully fall
+            # back to a contiguous copy instead of erroring with "view size
+            # not compatible with stride".
+            q_rope = query.reshape(batch_size, -1, self.head_size)
+            k_rope = key.reshape(batch_size, -1, self.head_size)
             if self.head_size != self.rotary_dim:
                 q_rope = q_rope[..., : self.rotary_dim]
                 k_rope = k_rope[..., : self.rotary_dim]

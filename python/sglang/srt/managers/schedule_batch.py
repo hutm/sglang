@@ -1511,6 +1511,10 @@ class ScheduleBatch(ScheduleBatchDllmMixin, ScheduleBatchDisaggregationDecodeMix
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    # Active block_size for the current pending block (LinearSpec dynamic-tier
+    # mode). Set by the scheduler before block dispatch. None → fall back to
+    # dllm_config.block_size at consumers (static-config path).
+    dllm_block_size: Optional[int] = None
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -2608,6 +2612,7 @@ class ScheduleBatch(ScheduleBatchDllmMixin, ScheduleBatchDisaggregationDecodeMix
             return_pooled_hidden_states=self.return_pooled_hidden_states,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            dllm_block_size=self.dllm_block_size,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -2835,6 +2840,9 @@ class ModelWorkerBatch:
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
+    # Per-block block_size when block_size_tiers are configured. Falls back to
+    # dllm_config.block_size at consumers when None (static-config path).
+    dllm_block_size: Optional[int] = None
 
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar

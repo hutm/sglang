@@ -323,7 +323,11 @@ class LinearSpec(DllmAlgorithm):
                 self._torch_profile_steps = 0  # disable further capture
 
         batch_size = forward_batch.batch_size
-        bs = self.block_size
+        # Per-block block_size: scheduler may have set it for tier policy,
+        # otherwise fall back to the static config.
+        bs = forward_batch.dllm_block_size
+        if bs is None:
+            bs = self.block_size
         eos_id = self._get_eos_id(model_runner)
 
         # ----------------------------------------------------------------

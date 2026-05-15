@@ -86,6 +86,12 @@ class SchedulerDllmMixin:
         # process_batch_result_dllm. Initialized to 0 here so the first
         # iteration starts a fresh window of 20 blocks.
         self._dllm_stats_skip_count = 0
+        # Tier-policy histogram (block_size_tiers); populated only when tiers
+        # are configured. Pre-initialized so the hot path doesn't branch on
+        # hasattr each block.
+        self._dllm_tier_hist: dict[int, int] = {}
+        self._dllm_tier_blocks: int = 0
+        self._dllm_pending_tier_bs: Optional[int] = None
         # Fine-grained DLLM scheduler profiling
         self._dllm_sched_prof = (
             self.dllm_config is not None
@@ -150,6 +156,44 @@ class SchedulerDllmMixin:
             _gt2 = self._dllm_time.perf_counter()
 
         batch = self._create_dllm_batch(can_run_list, forward_mode)
+
+        # Propagate the tier-selected block_size to the schedule batch so
+        # ForwardBatch.init_new picks the same tier_bs for positions /
+        # dllm_block_offsets. Per-req dllm_active_block_size is set earlier
+        # (in _prepare_staging_reqs / process_dllm_incoming_reqs) so that
+        # init_next_round_input builds fill_ids with the same tier_bs.
+        # Use the SAME stamped value to keep input_ids and positions length
+        # consistent — recomputing from len(batch.reqs) here can pick a
+        # different tier than reqs were initialized with if running_bs
+        # estimate diverged from final can_run_list size.
+        pending_tier_bs = self._dllm_pending_tier_bs
+        if (
+            getattr(self.dllm_config, "block_size_tiers", None)
+            and batch is not None
+            and batch.reqs
+            and pending_tier_bs is not None
+        ):
+            batch.dllm_block_size = pending_tier_bs
+
+        # Tier-policy histogram: log the distribution of block_size choices
+        # across blocks so we can validate the policy against actual workload.
+        if getattr(self.dllm_config, "block_size_tiers", None):
+            picked = self.dllm_config.select_block_size(running_bs)
+            self._dllm_tier_hist[picked] = self._dllm_tier_hist.get(picked, 0) + 1
+            self._dllm_tier_blocks += 1
+            if self._dllm_tier_blocks % 200 == 0:
+                tot = self._dllm_tier_blocks
+                breakdown = ", ".join(
+                    f"bs={k}: {v} ({v / tot * 100:.1f}%)"
+                    for k, v in sorted(self._dllm_tier_hist.items())
+                )
+                logger.info(
+                    "DLLM TIER POLICY (%d blocks): %s [last running_bs=%d -> bs=%d]",
+                    tot,
+                    breakdown,
+                    running_bs,
+                    picked,
+                )
 
         if _prof:
             _gt3 = self._dllm_time.perf_counter()
@@ -224,12 +268,18 @@ class SchedulerDllmMixin:
                     req, next_token_ids
                 )
                 new_tokens = len(next_token_ids)
+                # Block size used for this block (dynamic-tier or static).
+                block_bs = (
+                    req.dllm_active_block_size
+                    if req.dllm_active_block_size is not None
+                    else self.dllm_config.block_size
+                )
                 if new_tokens == 0:
                     # Free the entire allocated block to prevent kv_committed_len
                     # inflation. Without this, cache_finished_req frees only
                     # len(origin_input_ids + output_ids) positions which is less
                     # than kv_committed_len, permanently leaking block_size tokens.
-                    rejected = self.dllm_config.block_size
+                    rejected = block_bs
                     free_start = req.kv_committed_len - rejected
                     free_end = req.kv_committed_len
                     free_indices = self.req_to_token_pool.req_to_token[
@@ -245,8 +295,8 @@ class SchedulerDllmMixin:
 
                 req.output_ids.extend(next_token_ids)
 
-                if new_tokens < self.dllm_config.block_size:
-                    rejected = self.dllm_config.block_size - new_tokens
+                if new_tokens < block_bs:
+                    rejected = block_bs - new_tokens
                     free_start = req.kv_committed_len - rejected
                     free_end = req.kv_committed_len
                     free_indices = self.req_to_token_pool.req_to_token[
@@ -347,6 +397,7 @@ class SchedulerDllmMixin:
             # Re-prepare the running req for the next block (mirror of the
             # work _prepare_staging_reqs does, but for a single in-flight
             # req — no queue dance).
+            self._set_active_block_size_for(batch)
             req.init_next_round_input()
             if req.req_pool_idx is not None and req.kv_committed_len > 0:
                 kv_len = req.kv_committed_len
@@ -369,6 +420,20 @@ class SchedulerDllmMixin:
             if req.finished():
                 break
 
+    def _set_active_block_size_for(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Compute the tier-policy block_size for the current running batch and
+        propagate it to every req that's about to build a new block.
+
+        No-op when block_size_tiers are not configured.
+        """
+        if not getattr(self.dllm_config, "block_size_tiers", None):
+            return
+        running_bs = max(1, batch.batch_size())
+        bs = self.dllm_config.select_block_size(running_bs)
+        batch.dllm_block_size = bs
+        for req in batch.reqs:
+            req.dllm_active_block_size = bs
+
     def _prepare_staging_reqs(self: Scheduler) -> None:
         """Rebuild fill_ids and set prefix_indices for the next scheduling round.
 
@@ -380,6 +445,62 @@ class SchedulerDllmMixin:
         (save_kv_cache=True in nemotron_labs_dllm.py), so no separate KV-update EXTEND
         pass is needed between blocks.
         """
+        # Apply tier-policy block_size to ALL decode-phase DLLM reqs that
+        # will participate in the next batch. The next batch combines:
+        #   - STAGING_DECODE reqs in dllm_manager.waiting_queue
+        #     (in-flight reqs from prior DLLM blocks)
+        #   - INCOMING_DECODE reqs in dllm_manager.waiting_queue
+        #     (newly-prefilled reqs ready for first DLLM block)
+        # These two collectively form get_decode_requests(), and tier_bs
+        # MUST match across all of them so prepare_for_dllm_block_extend
+        # (called in _create_dllm_batch) builds input_ids with a uniform
+        # mask-tail length matching the positions/dllm_block_offsets that
+        # ForwardBatch.init_new produces from batch.dllm_block_size.
+        # Updating only staging_queue (the prior version of this fix)
+        # missed STAGING_DECODE reqs that didn't run a block in the
+        # immediately-preceding iteration (e.g. a prefill ran instead).
+        if getattr(self.dllm_config, "block_size_tiers", None):
+            # Reqs that will participate in this iter's DLLM batch:
+            #   - waiting_queue reqs already in a DECODE phase
+            #   - staging_queue reqs (these include just-prefilled reqs that
+            #     will transition to STAGING_DECODE via init_next_round_input
+            #     below).
+            staging_set = set(id(r) for r in self.dllm_manager.staging_queue)
+            decode_reqs = [
+                r
+                for r in self.dllm_manager.waiting_queue
+                if getattr(r, "dllm_phase", None)
+                in (DllmReqPhase.STAGING_DECODE, DllmReqPhase.INCOMING_DECODE)
+                or id(r) in staging_set
+            ]
+            running_bs = max(1, len(decode_reqs))
+            tier_bs = self.dllm_config.select_block_size(running_bs)
+            self._dllm_pending_tier_bs = tier_bs
+            # Stamp tier_bs on every participating req BEFORE
+            # init_next_round_input (in the loop below or in
+            # process_dllm_incoming_reqs) so fill_ids get a uniform mask
+            # tail length matching batch.dllm_block_size.
+            for req in decode_reqs:
+                old_bs = req.dllm_active_block_size
+                req.dllm_active_block_size = tier_bs
+                # Rebuild fill_ids inline for STAGING_DECODE reqs that are
+                # NOT in staging_queue (they wouldn't otherwise be re-init'd
+                # this iter — staging_queue reqs are rebuilt below).
+                if (
+                    id(req) not in staging_set
+                    and req.dllm_phase == DllmReqPhase.STAGING_DECODE
+                    and old_bs != tier_bs
+                ):
+                    req.init_next_round_input()
+                    if req.req_pool_idx is not None and req.kv_committed_len > 0:
+                        kv_len = req.kv_committed_len
+                        req.prefix_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, :kv_len
+                        ].to(torch.int64)
+                        req.determine_dllm_phase()
+                        req.set_extend_input_len(
+                            len(req.fill_ids) - len(req.prefix_indices)
+                        )
         for req in self.dllm_manager.staging_queue:
             req.init_next_round_input()
             if req.req_pool_idx is not None and req.kv_committed_len > 0:
@@ -614,6 +735,12 @@ class SchedulerDllmMixin:
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
         res = AddReqResult.CONTINUE
+        # Tier policy: incoming-decode reqs must use the same tier_bs
+        # computed in _prepare_staging_reqs so the entire batch shares one
+        # block_size. Without this, init_next_round_input below builds
+        # fill_ids with the static block_size, causing positions/input_ids
+        # length mismatch in ForwardBatch.init_new.
+        pending_tier_bs = self._dllm_pending_tier_bs
         for req in reqs:
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -626,6 +753,8 @@ class SchedulerDllmMixin:
                 ):
                     break
 
+            if pending_tier_bs is not None:
+                req.dllm_active_block_size = pending_tier_bs
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,

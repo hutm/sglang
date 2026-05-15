@@ -23,11 +23,26 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        # Active block_size for the request's CURRENT pending block. Set by the
+        # scheduler before init_next_round_input when block_size_tiers are
+        # configured. None → falls back to dllm_config.block_size (static path).
+        self.dllm_active_block_size: Optional[int] = None
 
         if self.dllm_config is not None:
             # Always run a causal/bidirectional EXTEND pass on the prompt first
             # to cache prompt KV before the first DLLM_EXTEND denoising pass.
             self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+
+    def _dllm_block_size(self: Req) -> int:
+        """Block size for the request's CURRENT pending block.
+
+        Returns the dynamically-set value when block_size_tiers are configured
+        and the scheduler has updated it for the current block; otherwise the
+        static dllm_config.block_size.
+        """
+        if self.dllm_active_block_size is not None:
+            return self.dllm_active_block_size
+        return self.dllm_config.block_size
 
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None
@@ -39,8 +54,9 @@ class ReqDllmMixin:
         ]
 
     def determine_dllm_phase(self: Req):
+        bs = self._dllm_block_size()
         prefix_length = len(self.prefix_indices)
-        min_required_length = prefix_length + self.dllm_config.block_size
+        min_required_length = prefix_length + bs
 
         if len(self.fill_ids) < min_required_length:
             return
@@ -48,7 +64,7 @@ class ReqDllmMixin:
         # Check the LATEST block (not the first block which may already be
         # denoised).  For block k>0, fill_ids = origin + output_k-1 + masks_k
         # so the last block_size tokens are the masks to denoise.
-        latest_block_start = len(self.fill_ids) - self.dllm_config.block_size
+        latest_block_start = len(self.fill_ids) - bs
         input_block = self.fill_ids[latest_block_start:]
         is_prefill_phase = self.dllm_config.mask_id not in input_block
 
@@ -68,7 +84,7 @@ class ReqDllmMixin:
         self.fill_ids = (
             self.origin_input_ids
             + self.output_ids
-            + [self.dllm_config.mask_id] * self.dllm_config.block_size
+            + [self.dllm_config.mask_id] * self._dllm_block_size()
         )
 
     def init_prompt_cache_input(self: Req):
@@ -124,9 +140,14 @@ class ReqDllmMixin:
         prefix_len = len(self.prefix_indices)
         # LinearSpec produces partial blocks, so prefix_len won't always be
         # block-aligned. Validate only for the initial prompt (before any
-        # accepted output) — raise instead of `assert` so the check survives
-        # `python -O`.
-        if not self.output_ids and prefix_len % self.dllm_config.block_size != 0:
+        # accepted output) AND only when block_size is static (alignment is
+        # meaningless under dynamic block_size_tiers). Raise rather than
+        # assert so `python -O` keeps the check.
+        if (
+            not self.output_ids
+            and self.dllm_active_block_size is None
+            and prefix_len % self.dllm_config.block_size != 0
+        ):
             raise ValueError(
                 f"DLLM prefix len {prefix_len} is not aligned to "
                 f"block_size {self.dllm_config.block_size}"
