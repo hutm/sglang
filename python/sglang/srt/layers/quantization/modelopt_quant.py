@@ -30,7 +30,10 @@ from sglang.srt.layers.moe.utils import (
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.parameter import (
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -62,6 +65,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
+    set_weight_attrs,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -1285,6 +1289,75 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
 
+    @staticmethod
+    def _narrow_or_pad_pre_quant_scale(
+        loaded_weight: torch.Tensor, start_idx: int, shard_size: int
+    ) -> torch.Tensor:
+        valid_size = min(max(loaded_weight.numel() - start_idx, 0), shard_size)
+        if valid_size == shard_size:
+            return loaded_weight.narrow(0, start_idx, shard_size)
+
+        loaded_shard = torch.ones(
+            shard_size, dtype=loaded_weight.dtype, device=loaded_weight.device
+        )
+        if valid_size > 0:
+            loaded_shard[:valid_size].copy_(
+                loaded_weight.narrow(0, start_idx, valid_size)
+            )
+        return loaded_shard
+
+    @staticmethod
+    def _load_pre_quant_scale(
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: Optional[Any] = None,
+    ) -> None:
+        loaded_weight = loaded_weight.reshape(-1)
+        shard_size = param.data.numel()
+
+        if loaded_weight.numel() != shard_size:
+            if loaded_weight.numel() > shard_size:
+                tp_group = get_tp_group()
+                full_size = shard_size * tp_group.world_size
+                if loaded_weight.numel() > full_size:
+                    raise ValueError(
+                        "pre_quant_scale has incompatible size: "
+                        f"expected at most {full_size}, got {loaded_weight.numel()}"
+                    )
+                start_idx = tp_group.rank_in_group * shard_size
+                loaded_weight = ModelOptFp4LinearMethod._narrow_or_pad_pre_quant_scale(
+                    loaded_weight, start_idx, shard_size
+                )
+            else:
+                loaded_weight = ModelOptFp4LinearMethod._narrow_or_pad_pre_quant_scale(
+                    loaded_weight, 0, shard_size
+                )
+
+        loaded_weight = loaded_weight.to(
+            device=param.data.device, dtype=param.data.dtype
+        )
+        if param.data.shape != loaded_weight.shape:
+            raise ValueError(
+                "pre_quant_scale has incompatible shape: "
+                f"expected {tuple(param.data.shape)}, got {tuple(loaded_weight.shape)}"
+            )
+
+        if getattr(param, "_sglang_pre_quant_scale_loaded", False):
+            if not torch.allclose(
+                param.data.to(torch.float32),
+                loaded_weight.to(torch.float32),
+                rtol=1e-3,
+                atol=1e-3,
+            ):
+                raise ValueError(
+                    "Fused NVFP4 projections require identical pre_quant_scale "
+                    f"values across shards; got conflicting shard {loaded_shard_id}."
+                )
+            return
+
+        param.data.copy_(loaded_weight)
+        param._sglang_pre_quant_scale_loaded = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1359,6 +1432,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         layer.register_parameter("weight_scale", weight_scale)
 
+        # AWQ checkpoints may include pre_quant_scale (per-input-channel activation
+        # scaling).  Initialize to ones so layers without it work identically.
+        pre_quant_scale = Parameter(
+            torch.ones(input_size_per_partition, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(pre_quant_scale, {"weight_loader": self._load_pre_quant_scale})
+        layer.register_parameter("pre_quant_scale", pre_quant_scale)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
@@ -1371,6 +1453,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
         copy_or_rebind_param(
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
+        )
+
+        # Cache whether pre_quant_scale is the identity vector, so the per-
+        # forward apply() can short-circuit the divide for non-AWQ checkpoints
+        # (the parameter is registered for every NVFP4 linear with default
+        # ones). Compute once here (during warmup) to avoid 1× host-sync per
+        # layer on every first forward.
+        layer.pre_quant_scale_is_identity = bool(
+            torch.all(layer.pre_quant_scale == 1).item()
         )
 
         # Store original output size before any padding
@@ -1448,8 +1539,32 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         batches, rows, cols = padded_scales.shape
         assert rows % 128 == 0
         assert cols % 4 == 0
-        padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
-        padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
+        # Select scale layout based on backend requirements:
+        #
+        # flashinfer_cutlass (SM100/SM110): natural row-major [N, K_sf] layout.
+        #   The cutlass kernel reads scales from natural padded layout directly.
+        #   No permutation needed. Verified: do_shuffle=False gives cosine=0.99.
+        #
+        # flashinfer_cudnn (b_descale F8_128x4): 4-elem tiles in K_sf, 128-elem in N
+        #   offset = (k//4 * N//128 + n//128)*512 + k%4*128 + n%128
+        #   reshape [B, N//128, 128, K_sf//4, 4] → permute (0, 3, 1, 4, 2)
+        #
+        # JIT CUTLASS: proprietary SGLang/JIT format.
+        _backend = get_fp4_gemm_runner_backend()
+        if enable_flashinfer_fp4_gemm and not _backend.is_cutlass():
+            if _backend.is_flashinfer_cudnn():
+                # cuDNN b_descale F8_128x4 format
+                padded_scales = padded_scales.reshape(
+                    batches, rows // 128, 128, cols // 4, 4
+                )
+                padded_scales = padded_scales.permute((0, 3, 1, 4, 2))
+            # else: flashinfer_cutlass uses natural row-major layout (no permutation)
+        else:
+            # JIT CUTLASS: proprietary SGLang/JIT format
+            padded_scales = padded_scales.reshape(
+                batches, rows // 128, 4, 32, cols // 4, 4
+            )
+            padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
             padded_scales.reshape(M_padded, K_padded)
@@ -1473,6 +1588,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
+
+        # Apply AWQ pre_quant_scale: per-input-channel activation scaling.
+        # AWQ bakes W*s into weights; inference divides activations by s to
+        # compensate. Short-circuited for non-AWQ checkpoints where the
+        # registered scale is identity (cached in process_weights_after_loading).
+        if not layer.pre_quant_scale_is_identity:
+            x = x / layer.pre_quant_scale.to(x.dtype)
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
