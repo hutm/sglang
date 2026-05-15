@@ -214,6 +214,7 @@ class Fp8GemmRunnerBackend(Enum):
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
+_FLASHINFER_MXFP8_AVAILABLE = False
 
 
 def _check_cutlass_block_fp8_hardware_support() -> bool:
@@ -222,12 +223,16 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
-    from flashinfer import SfLayout
-    from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
-    from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
-    from sglang.srt.utils.custom_op import register_custom_op
+    try:
+        from flashinfer import SfLayout
+        from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
+        from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
+    except ImportError:
+        pass
+    else:
+        _FLASHINFER_MXFP8_AVAILABLE = True
 
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:
@@ -282,64 +287,67 @@ if is_blackwell_supported() and is_flashinfer_available():
             backend=backend,
         )
 
-    # Wrap MXFP8 ops as custom ops so torch.compile does not trace into
-    # flashinfer's JIT compilation path (filesystem checks/cubin loader).
-    def _fake_flashinfer_mxfp8_quantize(
-        input: torch.Tensor,
-        _is_sf_swizzled_layout: bool = True,
-        alignment: int = 32,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Fake mode only needs dtypes and output rank to propagate compile graph.
-        # The scale tensor shape is not consumed before the following fake mm op.
-        k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
-        q_input = input.new_empty(
-            (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
-        )
-        scale = input.new_empty((1,), dtype=torch.uint8)
-        return q_input, scale
+    if _FLASHINFER_MXFP8_AVAILABLE:
+        # Wrap MXFP8 ops as custom ops so torch.compile does not trace into
+        # flashinfer's JIT compilation path (filesystem checks/cubin loader).
+        def _fake_flashinfer_mxfp8_quantize(
+            input: torch.Tensor,
+            _is_sf_swizzled_layout: bool = True,
+            alignment: int = 32,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            # Fake mode only needs dtypes and output rank to propagate compile graph.
+            # The scale tensor shape is not consumed before the following fake mm op.
+            k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
+            q_input = input.new_empty(
+                (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
+            )
+            scale = input.new_empty((1,), dtype=torch.uint8)
+            return q_input, scale
 
-    @register_custom_op(
-        op_name="flashinfer_mxfp8_quantize",
-        mutates_args=[],
-        fake_impl=_fake_flashinfer_mxfp8_quantize,
-    )
-    def flashinfer_mxfp8_quantize(
-        input: torch.Tensor,
-        is_sf_swizzled_layout: bool = True,
-        alignment: int = 32,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return _raw_flashinfer_mxfp8_quantize(
-            input,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            alignment=alignment,
-            sf_swizzle_layout=SfLayout.layout_128x4,
+        @register_custom_op(
+            op_name="flashinfer_mxfp8_quantize",
+            mutates_args=[],
+            fake_impl=_fake_flashinfer_mxfp8_quantize,
         )
+        def flashinfer_mxfp8_quantize(
+            input: torch.Tensor,
+            is_sf_swizzled_layout: bool = True,
+            alignment: int = 32,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            return _raw_flashinfer_mxfp8_quantize(
+                input,
+                is_sf_swizzled_layout=is_sf_swizzled_layout,
+                alignment=alignment,
+                sf_swizzle_layout=SfLayout.layout_128x4,
+            )
 
-    @register_custom_op(
-        op_name="flashinfer_mm_mxfp8",
-        mutates_args=[],
-        fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, use_8x4_sf_layout=False, backend="auto": (
-            q_input.new_empty((q_input.shape[0], weight_t.shape[1]), dtype=out_dtype)
-        ),
-    )
-    def flashinfer_mm_mxfp8(
-        q_input: torch.Tensor,
-        weight_t: torch.Tensor,
-        x_scale_u8: torch.Tensor,
-        weight_scale_t: torch.Tensor,
-        out_dtype: torch.dtype,
-        use_8x4_sf_layout: bool = False,
-        backend: str = "auto",
-    ) -> torch.Tensor:
-        return _raw_flashinfer_mm_mxfp8(
-            q_input,
-            weight_t,
-            x_scale_u8,
-            weight_scale_t,
-            out_dtype=out_dtype,
-            use_8x4_sf_layout=use_8x4_sf_layout,
-            backend=backend,
+        @register_custom_op(
+            op_name="flashinfer_mm_mxfp8",
+            mutates_args=[],
+            fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, use_8x4_sf_layout=False, backend="auto": (
+                q_input.new_empty(
+                    (q_input.shape[0], weight_t.shape[1]), dtype=out_dtype
+                )
+            ),
         )
+        def flashinfer_mm_mxfp8(
+            q_input: torch.Tensor,
+            weight_t: torch.Tensor,
+            x_scale_u8: torch.Tensor,
+            weight_scale_t: torch.Tensor,
+            out_dtype: torch.dtype,
+            use_8x4_sf_layout: bool = False,
+            backend: str = "auto",
+        ) -> torch.Tensor:
+            return _raw_flashinfer_mm_mxfp8(
+                q_input,
+                weight_t,
+                x_scale_u8,
+                weight_scale_t,
+                out_dtype=out_dtype,
+                use_8x4_sf_layout=use_8x4_sf_layout,
+                backend=backend,
+            )
 
 
 if is_sm90_supported() and is_flashinfer_available():
@@ -373,8 +381,20 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     """
     backend = get_fp8_gemm_runner_backend()
     if backend.is_flashinfer_trtllm():
+        if not _FLASHINFER_MXFP8_AVAILABLE:
+            raise RuntimeError(
+                "FlashInfer MXFP8 GEMM requested via --fp8-gemm-backend="
+                "flashinfer_trtllm, but the installed FlashInfer package does "
+                "not expose mxfp8_quantize and mm_mxfp8."
+            )
         return flashinfer_mxfp8_blockscaled_linear
     elif backend.is_flashinfer_cutlass():
+        if not _FLASHINFER_MXFP8_AVAILABLE:
+            raise RuntimeError(
+                "FlashInfer MXFP8 GEMM requested via --fp8-gemm-backend="
+                "flashinfer_cutlass, but the installed FlashInfer package does "
+                "not expose mxfp8_quantize and mm_mxfp8."
+            )
         return flashinfer_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
 
