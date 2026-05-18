@@ -141,7 +141,7 @@ class DllmConfig:
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
             "DiffEncoderModel": {"block_size": 32, "mask_id": 151662},
-            "NemotronLabsDiffusionEncoderModel": {"block_size": 32, "mask_id": 100},
+            "NemotronLabsDiffusionModel": {"block_size": 32, "mask_id": 100},
         }
 
         arch = model_config.hf_config.architectures[0]

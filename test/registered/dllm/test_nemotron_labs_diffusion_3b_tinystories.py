@@ -2,7 +2,7 @@
 
 The 8B Nemotron-Labs-Diffusion model used during development is gated on
 HuggingFace and cannot be pulled by CI. This file exercises the same
-``NemotronLabsDiffusionEncoderModel`` architecture using a publicly available
+``NemotronLabsDiffusionModel`` architecture using a publicly available
 3B checkpoint trained on TinyStories. The two scheduling algorithms
 (FastDiffuser iterative denoising and LinearSpec speculative decoding) get
 one server-launch fixture each.

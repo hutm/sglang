@@ -3,8 +3,8 @@
 SGLang native implementations of Nemotron Labs Diffusion LMs.
 
 Two architectures:
-  - DiffEncoderModel      : Qwen3-based  (nvidia/Nemotron-Diffusion-Research-8B-v0)
-  - NemotronLabsDiffusionEncoderModel : (nvidia/Nemotron-Diffusion-Exp-Ministral-8B)
+  - DiffEncoderModel       : Qwen3-based  (nvidia/Nemotron-Diffusion-Research-8B-v0)
+  - NemotronLabsDiffusionModel : (nvidia/Nemotron-Labs-Diffusion-8B)
 
 Both are bidirectional (encoder-only attention) masked diffusion language models
 that use an iterative denoising loop at inference time (FastDiffuser / LLaDA-style).
@@ -395,7 +395,7 @@ class DiffEncoderModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# NemotronLabsDiffusionEncoderModel
+# NemotronLabsDiffusionModel
 # ---------------------------------------------------------------------------
 
 
@@ -573,7 +573,7 @@ class NemotronLabsDiffusionLayer(nn.Module):
         return hidden_states, residual
 
 
-class NemotronLabsDiffusionModel(nn.Module):
+class NemotronLabsDiffusionEncoder(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -643,11 +643,11 @@ class NemotronLabsDiffusionModel(nn.Module):
         return hidden_states
 
 
-class NemotronLabsDiffusionEncoderModel(nn.Module):
+class NemotronLabsDiffusionModel(nn.Module):
     """
-    Nemotron Labs Diffusion LM (nvidia/Nemotron-Diffusion-Exp-Ministral-8B).
+    Nemotron Labs Diffusion LM (nvidia/Nemotron-Labs-Diffusion-8B).
 
-    HF architecture name: NemotronLabsDiffusionEncoderModel
+    HF architecture name: NemotronLabsDiffusionModel
     mask_token_id: 100
     """
 
@@ -673,7 +673,7 @@ class NemotronLabsDiffusionEncoderModel(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
 
-        self.model = NemotronLabsDiffusionModel(
+        self.model = NemotronLabsDiffusionEncoder(
             config,
             quant_config,
             prefix=add_prefix("model", prefix),
@@ -753,4 +753,4 @@ class NemotronLabsDiffusionEncoderModel(nn.Module):
 
 
 # Register both model architectures in SGLang's ModelRegistry.
-EntryClass = [DiffEncoderModel, NemotronLabsDiffusionEncoderModel]
+EntryClass = [DiffEncoderModel, NemotronLabsDiffusionModel]

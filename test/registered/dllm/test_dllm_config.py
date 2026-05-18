@@ -120,7 +120,7 @@ class TestFromServerArgs(unittest.TestCase):
             def from_server_args(*args, **kwargs):
                 return SimpleNamespace(
                     hf_config=SimpleNamespace(
-                        architectures=["NemotronLabsDiffusionEncoderModel"]
+                        architectures=["NemotronLabsDiffusionModel"]
                     )
                 )
 
@@ -174,7 +174,7 @@ class TestServerArgsDllmValidation(unittest.TestCase):
                 def from_server_args(*args, **kwargs):
                     return SimpleNamespace(
                         hf_config=SimpleNamespace(
-                            architectures=["NemotronLabsDiffusionEncoderModel"]
+                            architectures=["NemotronLabsDiffusionModel"]
                         )
                     )
 
