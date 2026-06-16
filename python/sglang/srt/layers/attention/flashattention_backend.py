@@ -1821,18 +1821,30 @@ class FlashAttentionBackend(AttentionBackend):
             self._sched_meta_buf = None
 
         if self.is_dllm_model:
-            block_size = self.dllm_config.block_size
+            # block_size_tiers: one cu_seqlens_q buffer per distinct block_size.
+            # Each buffer holds arange(0, max_bs*b+1, b); values are baked at
+            # alloc time and read fresh at every replay, so per-tier captures
+            # can co-exist without overwriting one another.
+            tiers = getattr(self.dllm_config, "block_size_tiers", None)
+            block_sizes = (
+                sorted({t["block_size"] for t in tiers})
+                if tiers
+                else [self.dllm_config.block_size]
+            )
             self.dllm_extend_cuda_graph_buffers = {
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
                 ),
-                "cu_seqlens_q": torch.arange(
-                    0,
-                    max_bs * block_size + 1,
-                    block_size,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
+                "cu_seqlens_q_by_block_size": {
+                    b: torch.arange(
+                        0,
+                        max_bs * b + 1,
+                        b,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    for b in block_sizes
+                },
                 "cu_seqlens_k": torch.zeros(
                     max_bs + 1, dtype=torch.int32, device=self.device
                 ),
@@ -2308,7 +2320,11 @@ class FlashAttentionBackend(AttentionBackend):
             self.draft_extend_metadata[bs] = metadata
 
         elif forward_mode.is_dllm_extend():
-            block_size = self.dllm_config.block_size
+            block_size = (
+                max(1, num_tokens // bs)
+                if num_tokens and bs
+                else self.dllm_config.block_size
+            )
             # Capture the maximum supported sequence shape so replay never
             # requires a larger FA4 grid than the captured graph.
             max_pool_len = self.req_to_token.shape[1]
@@ -2335,9 +2351,9 @@ class FlashAttentionBackend(AttentionBackend):
                 :bs, :
             ]
             metadata.max_seq_len_q = block_size
-            metadata.cu_seqlens_q = self.dllm_extend_cuda_graph_buffers["cu_seqlens_q"][
-                : bs + 1
-            ]
+            metadata.cu_seqlens_q = self.dllm_extend_cuda_graph_buffers[
+                "cu_seqlens_q_by_block_size"
+            ][block_size][: bs + 1]
 
             normal_decode_set_metadata(
                 metadata.cache_seqlens_int32,
@@ -2352,7 +2368,9 @@ class FlashAttentionBackend(AttentionBackend):
                 self.page_size,
             )
             metadata.max_seq_len_k = capture_seq_len
-            metadata_key = f"causal_{bs}" if dllm_causal else bs
+            metadata_key = (
+                f"causal_{bs}_bs{block_size}" if dllm_causal else f"{bs}_bs{block_size}"
+            )
             self.dllm_extend_cuda_graph_metadata[metadata_key] = metadata
 
         if encoder_lens is not None:
@@ -2407,7 +2425,10 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
         if forward_mode.is_dllm_extend():
-            metadata_key = f"causal_{bs}" if dllm_causal else bs
+            block_size = kwargs.get("dllm_block_size") or self.dllm_config.block_size
+            metadata_key = (
+                f"causal_{bs}_bs{block_size}" if dllm_causal else f"{bs}_bs{block_size}"
+            )
             metadata = self.dllm_extend_cuda_graph_metadata[metadata_key]
             max_seq_len_k = int(seq_lens_cpu.max().item())
             max_seq_pages = (max_seq_len_k + self.page_size - 1) // self.page_size

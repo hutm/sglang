@@ -157,9 +157,7 @@ def build_replay_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
-        dllm_causal_kv_update=getattr(
-            forward_batch, "dllm_causal_kv_update", False
-        ),
+        dllm_causal_kv_update=getattr(forward_batch, "dllm_causal_kv_update", False),
         dllm_block_size=getattr(forward_batch, "dllm_block_size", None),
     )
 
@@ -272,7 +270,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = max(bs * self._num_tokens_for(bs) for bs in self.capture_bs)
+        self.max_num_token = max(
+            bs * self._num_tokens_for(bs) for bs in self.capture_bs
+        )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed

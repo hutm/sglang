@@ -133,6 +133,35 @@ class TestFromServerArgs(unittest.TestCase):
 
 
 class TestServerArgsDllmValidation(unittest.TestCase):
+    def test_fa4_accepts_dynamic_block_tiers(self):
+        from sglang.srt.server_args import ServerArgs
+
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
+            f.write(
+                "block_size: 32\n"
+                "block_size_tiers:\n"
+                "  - {max_running_bs: 4, block_size: 32}\n"
+                "  - {max_running_bs: 9999, block_size: 8}\n"
+            )
+            f.flush()
+            server_args = ServerArgs(
+                model_path="dummy",
+                dllm_algorithm="ExternalTestAlgorithm",
+                dllm_algorithm_config=f.name,
+                attention_backend="fa4",
+                disable_radix_cache=True,
+                disable_overlap_schedule=True,
+                max_running_requests=128,
+            )
+            model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["NemotronLabsDiffusionModel"])
+            )
+            with patch(
+                "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                return_value=model_config,
+            ):
+                server_args._handle_dllm_inference()
+
     def test_pipeline_parallelism_is_disabled_for_dllm(self):
         from sglang.srt.server_args import ServerArgs
 
