@@ -6300,7 +6300,11 @@ class ServerArgs:
             self.disable_overlap_schedule = True
 
         if not self.disable_radix_cache:
-            if self.page_size % config.block_size != 0:
+            if config.algorithm_config.get("partial_acceptance", False):
+                if self.page_size != 1:
+                    logger.info("Setting page size to 1 for DLLM partial acceptance")
+                    self.page_size = 1
+            elif self.page_size % config.block_size != 0:
                 logger.warning(
                     f"Setting page size to {config.block_size} for diffusion LLM inference"
                 )
