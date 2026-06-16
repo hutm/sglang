@@ -6285,9 +6285,12 @@ class ServerArgs:
                 )
                 self.attention_backend = "ascend"
         elif cuda_graph_enabled:
-            if self.attention_backend != "flashinfer":
+            if self.attention_backend not in ("flashinfer", "fa4"):
                 logger.warning(
-                    "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+                    "Attention backend must be 'flashinfer' or 'fa4' for "
+                    "diffusion LLM inference with CUDA graph; overriding "
+                    "%s -> flashinfer.",
+                    self.attention_backend,
                 )
                 self.attention_backend = "flashinfer"
         if not self.disable_overlap_schedule:
