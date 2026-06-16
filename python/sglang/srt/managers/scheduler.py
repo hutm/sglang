@@ -1544,6 +1544,7 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                self.maybe_run_dllm_inner_loop(batch)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()

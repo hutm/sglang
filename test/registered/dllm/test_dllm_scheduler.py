@@ -75,5 +75,30 @@ class TestDllmPromptAdmission(unittest.TestCase):
         req.init_prompt_cache_input.assert_not_called()
 
 
+class TestDllmBatchFastPath(unittest.TestCase):
+    def test_requires_plain_text_requests(self):
+        req = SimpleNamespace(
+            return_logprob=False,
+            input_embeds=None,
+            positional_embed_overrides=None,
+            multimodal_inputs=None,
+            mamba_pool_idx=None,
+        )
+        can_use = SchedulerDllmMixin._can_use_dllm_batch_fast_path
+
+        self.assertTrue(can_use([req]))
+        for field in (
+            "return_logprob",
+            "input_embeds",
+            "positional_embed_overrides",
+            "multimodal_inputs",
+            "mamba_pool_idx",
+        ):
+            value = True if field == "return_logprob" else object()
+            setattr(req, field, value)
+            self.assertFalse(can_use([req]), field)
+            setattr(req, field, False if field == "return_logprob" else None)
+
+
 if __name__ == "__main__":
     unittest.main()
