@@ -18,9 +18,12 @@ class ScheduleBatchDllmMixin:
         bs = len(reqs)
         device = self.device
 
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        seq_lens = [len(r.fill_ids) for r in reqs]
-        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        fill_ids = [r.get_fill_ids() for r in reqs]
+        input_ids = [ids[len(r.prefix_indices) :] for ids, r in zip(fill_ids, reqs)]
+        seq_lens = [len(ids) for ids in fill_ids]
+        orig_seq_lens = [
+            max(len(r.full_untruncated_fill_ids), len(r.origin_input_ids)) for r in reqs
+        ]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_range.length for r in reqs]
         input_id_lens = [len(ids) for ids in input_ids]

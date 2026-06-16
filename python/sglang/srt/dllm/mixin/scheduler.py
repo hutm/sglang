@@ -66,6 +66,7 @@ class SchedulerDllmMixin:
         )
         if self._dllm_inner_k_blocks < 1:
             raise ValueError("inner_k_blocks must be at least 1")
+        self._dllm_pending_tier_bs: Optional[int] = None
 
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
@@ -100,6 +101,15 @@ class SchedulerDllmMixin:
         # Create and prepare batch
         batch = self._create_dllm_batch(can_run_list, forward_mode)
 
+        pending_tier_bs = self._dllm_pending_tier_bs
+        if (
+            getattr(self.dllm_config, "block_size_tiers", None)
+            and batch is not None
+            and batch.reqs
+            and pending_tier_bs is not None
+        ):
+            batch.dllm_block_size = pending_tier_bs
+
         return batch
 
     def process_batch_result_dllm(
@@ -130,9 +140,14 @@ class SchedulerDllmMixin:
                     req, next_token_ids
                 )
                 new_tokens = len(next_token_ids)
+                block_bs = (
+                    req.dllm_active_block_size
+                    if req.dllm_active_block_size is not None
+                    else self.dllm_config.block_size
+                )
                 if new_tokens == 0:
                     # No accepted tokens: release the speculative block now.
-                    rejected = self.dllm_config.block_size
+                    rejected = block_bs
                     free_start = req.kv_committed_len - rejected
                     free_end = req.kv_committed_len
                     free_indices = self.req_to_token_pool.req_to_token[
@@ -150,8 +165,8 @@ class SchedulerDllmMixin:
 
                 req.output_ids.extend(next_token_ids)
 
-                if new_tokens < self.dllm_config.block_size:
-                    rejected = self.dllm_config.block_size - new_tokens
+                if new_tokens < block_bs:
+                    rejected = block_bs - new_tokens
                     free_start = req.kv_committed_len - rejected
                     free_end = req.kv_committed_len
                     free_indices = self.req_to_token_pool.req_to_token[
@@ -204,6 +219,7 @@ class SchedulerDllmMixin:
             )
         req = batch.reqs[0]
         for _ in range(k):
+            self._set_active_block_size_for(batch)
             req.init_next_round_input()
             if req.req_pool_idx is not None and req.kv_committed_len > 0:
                 kv_len = req.kv_committed_len
@@ -224,8 +240,44 @@ class SchedulerDllmMixin:
             if req.finished():
                 break
 
+    def _set_active_block_size_for(self: Scheduler, batch: ScheduleBatch) -> None:
+        if not getattr(self.dllm_config, "block_size_tiers", None):
+            return
+        running_bs = max(1, batch.batch_size())
+        bs = self.dllm_config.select_block_size(running_bs)
+        batch.dllm_block_size = bs
+        for req in batch.reqs:
+            req.dllm_active_block_size = bs
+
     def _prepare_staging_reqs(self: Scheduler) -> None:
-        """Prepare staged requests for the next DLLM round."""
+        if getattr(self.dllm_config, "block_size_tiers", None):
+            staging_set = set(id(r) for r in self.dllm_manager.staging_queue)
+            decode_reqs = [
+                r
+                for r in self.dllm_manager.waiting_queue
+                if getattr(r, "dllm_phase", None)
+                in (DllmReqPhase.STAGING_DECODE, DllmReqPhase.INCOMING_DECODE)
+                or id(r) in staging_set
+            ]
+            running_bs = max(1, len(decode_reqs))
+            tier_bs = self.dllm_config.select_block_size(running_bs)
+            self._dllm_pending_tier_bs = tier_bs
+            for req in decode_reqs:
+                old_bs = req.dllm_active_block_size
+                req.dllm_active_block_size = tier_bs
+                if (
+                    id(req) not in staging_set
+                    and req.dllm_phase == DllmReqPhase.STAGING_DECODE
+                    and old_bs != tier_bs
+                ):
+                    req.init_next_round_input()
+                    if req.req_pool_idx is not None and req.kv_committed_len > 0:
+                        kv_len = req.kv_committed_len
+                        req.prefix_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, :kv_len
+                        ].to(torch.int64)
+                        req.determine_dllm_phase()
+                        req._set_dllm_extend_range_to_fill_len()
         for req in self.dllm_manager.staging_queue:
             req.init_next_round_input()
             if req.req_pool_idx is not None and req.kv_committed_len > 0:
@@ -285,7 +337,6 @@ class SchedulerDllmMixin:
         )
 
     def _process_dllm_batches(self: Scheduler, adder: PrefillAdder) -> ForwardMode:
-        """Select prompt-cache or denoising work for this scheduler tick."""
         incoming_prefill = [
             req
             for req in self.dllm_manager.waiting_queue
@@ -319,7 +370,6 @@ class SchedulerDllmMixin:
     def _process_incoming_prefill_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
     ) -> None:
-        """Schedule the causal prompt-cache pass."""
         for req in reqs:
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -448,6 +498,7 @@ class SchedulerDllmMixin:
     ) -> AddReqResult:
         """Process incoming DLLM requests with resource allocation and preemption."""
         res = AddReqResult.CONTINUE
+        pending_tier_bs = self._dllm_pending_tier_bs
         for req in reqs:
             # Check if batch is full
             running_bs = len(self.running_batch.reqs)
@@ -461,6 +512,9 @@ class SchedulerDllmMixin:
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
+
+            if pending_tier_bs is not None:
+                req.dllm_active_block_size = pending_tier_bs
 
             # Prepare and add request
             req.init_next_round_input(self.tree_cache)

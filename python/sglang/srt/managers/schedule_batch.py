@@ -1806,6 +1806,7 @@ class ScheduleBatch(ScheduleBatchDllmMixin, ScheduleBatchDisaggregationDecodeMix
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    dllm_block_size: Optional[int] = None
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -2082,8 +2083,7 @@ class ScheduleBatch(ScheduleBatchDllmMixin, ScheduleBatchDisaggregationDecodeMix
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # Slice to match extend_input_len — PrefillAdder truncates
-                # fill_len/extend_input_len on chunk overflow but not input_embeds.
+                # Slice to match PrefillAdder truncation.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_range.length]
                 )

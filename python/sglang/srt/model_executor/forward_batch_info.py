@@ -612,6 +612,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Select causal attention for FastDiffuser final KV updates.
     dllm_causal_kv_update: bool = False
 
+    dllm_block_size: Optional[int] = None
+
     @classmethod
     def init_new(
         cls,
@@ -790,7 +792,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None and ret.forward_mode.is_dllm_extend():
-            block_size = batch.dllm_config.block_size
+            block_size = (
+                batch.dllm_block_size
+                if batch.dllm_block_size is not None
+                else batch.dllm_config.block_size
+            )
+            ret.dllm_block_size = block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
             ret.positions = torch.tensor(

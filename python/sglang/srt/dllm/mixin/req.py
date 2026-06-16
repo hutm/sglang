@@ -24,6 +24,7 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        self.dllm_active_block_size: Optional[int] = None
 
         if self.dllm_config is not None:
             if self.dllm_config.causal_context:
@@ -32,6 +33,11 @@ class ReqDllmMixin:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
             else:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+
+    def _dllm_block_size(self: Req) -> int:
+        if self.dllm_active_block_size is not None:
+            return self.dllm_active_block_size
+        return self.dllm_config.block_size
 
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None
@@ -43,17 +49,15 @@ class ReqDllmMixin:
         ]
 
     def determine_dllm_phase(self: Req):
+        bs = self._dllm_block_size()
         prefix_length = len(self.prefix_indices)
-        min_required_length = prefix_length + self.dllm_config.block_size
+        min_required_length = prefix_length + bs
 
         if len(self.full_untruncated_fill_ids) < min_required_length:
-            # still incoming stage
             return
 
         if self.dllm_config.causal_context:
-            latest_block_start = (
-                len(self.full_untruncated_fill_ids) - self.dllm_config.block_size
-            )
+            latest_block_start = len(self.full_untruncated_fill_ids) - bs
             input_block = self.full_untruncated_fill_ids[latest_block_start:]
         else:
             input_block = self.full_untruncated_fill_ids[
@@ -73,12 +77,12 @@ class ReqDllmMixin:
             self.dllm_block_offset = (
                 0
                 if not self.dllm_initialized
-                else self.dllm_block_offset + self.dllm_config.block_size
+                else self.dllm_block_offset + self._dllm_block_size()
             )
         self.full_untruncated_fill_ids = (
             self.origin_input_ids
             + self.output_ids
-            + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
+            + array("q", [self.dllm_config.mask_id] * self._dllm_block_size())
         )
         self.dllm_initialized = True
 
@@ -87,8 +91,6 @@ class ReqDllmMixin:
         self.set_extend_range(prefix_len, len(self.full_untruncated_fill_ids))
 
     def init_prompt_cache_input(self: Req):
-        """Prepare the causal prompt-cache pass."""
-        # flatten_arrays_to_int64_tensor expects a buffer-backed array.
         self.full_untruncated_fill_ids = array("q", self.origin_input_ids)
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self._set_dllm_extend_range_to_fill_len()
@@ -134,8 +136,13 @@ class ReqDllmMixin:
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)
-        # Generated blocks may be partially accepted; only the prompt must be aligned.
-        if not self.output_ids and prefix_len % self.dllm_config.block_size != 0:
+        # Generated blocks may be partially accepted; only an untiered prompt
+        # must be aligned to the model default block size.
+        if (
+            not self.output_ids
+            and self.dllm_active_block_size is None
+            and prefix_len % self.dllm_config.block_size != 0
+        ):
             raise ValueError(
                 f"DLLM prefix len {prefix_len} is not aligned to "
                 f"block_size {self.dllm_config.block_size}"

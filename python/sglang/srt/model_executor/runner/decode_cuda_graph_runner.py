@@ -157,7 +157,10 @@ def build_replay_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
-        dllm_causal_kv_update=getattr(forward_batch, "dllm_causal_kv_update", False),
+        dllm_causal_kv_update=getattr(
+            forward_batch, "dllm_causal_kv_update", False
+        ),
+        dllm_block_size=getattr(forward_batch, "dllm_block_size", None),
     )
 
 
@@ -250,6 +253,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
+        self._dllm_tiers = (
+            getattr(self.dllm_config, "block_size_tiers", None)
+            if self.is_dllm
+            else None
+        )
+
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
@@ -263,7 +272,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = max(bs * self._num_tokens_for(bs) for bs in self.capture_bs)
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -407,6 +416,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return variant_label
         return f"causal_{variant_label}" if variant_label else "causal"
 
+    def _num_tokens_for(self, bs: int) -> int:
+        if self._dllm_tiers:
+            return int(self.dllm_config.select_block_size(bs))
+        return self.num_tokens_per_bs
+
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -423,6 +437,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             cuda_graph_bs = forward_batch.batch_size
+
+        if (
+            self.is_dllm
+            and self._dllm_tiers
+            and forward_batch.dllm_block_size is not None
+        ):
+            target_bs = cuda_graph_bs
+            if not self.disable_padding:
+                if cuda_graph_bs > self.max_bs:
+                    return False
+                target_bs = self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
+            if int(forward_batch.dllm_block_size) != self._num_tokens_for(target_bs):
+                return False
 
         variant_label = self._resolve_lora_variant(forward_batch)
         dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
@@ -532,7 +559,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """
         bs = size
         buffers: DecodeInputBuffers = self.buffers
-        num_tokens = bs * self.num_tokens_per_bs
+        ntpb = self._num_tokens_for(bs)
+        num_tokens = bs * ntpb
 
         # Registry-owned FB-shared slots come through the registry (which
         # shares physical storage with self.buffers via source=...); the rest
@@ -658,6 +686,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             lora_ids=lora_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
+            dllm_block_size=ntpb if self.is_dllm else None,
         )
 
         # Trip the coordinator so the hisparse code path is captured into the
@@ -753,7 +782,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 with torch_compile_decoration.patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
+                    num_tokens=bs * self._num_tokens_for(bs),
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
@@ -779,7 +808,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dllm_causal: bool = False,
     ):
         bs = size
-        num_tokens = bs * self.num_tokens_per_bs
+        num_tokens = bs * self._num_tokens_for(bs)
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if self.model_runner.server_args.debug_cuda_graph:
@@ -945,12 +974,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        ntpb = (
+            int(forward_batch.dllm_block_size)
+            if (self._dllm_tiers and forward_batch.dllm_block_size is not None)
+            else self.num_tokens_per_bs
+        )
+        raw_num_token = raw_bs * ntpb
 
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
+                max_num_tokens / ntpb
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
@@ -965,7 +999,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raw_bs=raw_bs,
             padded_bs=bs,
             raw_num_tokens=raw_num_token,
-            padded_num_tokens=bs * self.num_tokens_per_bs,
+            padded_num_tokens=bs * ntpb,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
@@ -995,7 +1029,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             buffers=buffers,
             bs=bs,
             raw_bs=raw_bs,
-            num_tokens=bs * self.num_tokens_per_bs,
+            num_tokens=bs * ntpb,
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,

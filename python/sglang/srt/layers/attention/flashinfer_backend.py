@@ -428,8 +428,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if is_sm100_supported():
-            # Disable CUTLASS backend for piecewise CUDA graphs and DLLM whole-graph
-            # capture due to TMA descriptor initialization issues on SM100 GPUs.
             if (
                 not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 and not self.is_dllm_model
@@ -687,13 +685,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
-            metadata_key = f"causal_{bs}" if dllm_causal else bs
+            block_size = (
+                getattr(forward_batch, "dllm_block_size", None)
+                or self.dllm_config.block_size
+            )
+            metadata_key = (
+                f"causal_{bs}_bs{block_size}" if dllm_causal else f"{bs}_bs{block_size}"
+            )
+            prefix_lens = seq_lens - block_size
+            if in_capture:
+                max_pool_len = self.indices_updater_prefill.req_to_token.shape[1]
+                capture_prefix_len = min(8192, max(0, max_pool_len - block_size))
+                seq_lens = torch.full_like(seq_lens, capture_prefix_len + block_size)
+                seq_lens_cpu = seq_lens.cpu()
+                seq_lens_sum = int(seq_lens.sum().item())
+                prefix_lens = torch.full_like(seq_lens, capture_prefix_len)
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=prefix_lens[:bs],
                 prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -953,9 +965,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 and getattr(spec_info, "custom_mask", None) is not None
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            metadata_key = (
-                f"causal_{bs}" if forward_mode.is_dllm_extend() and dllm_causal else bs
-            )
+            if forward_mode.is_dllm_extend():
+                block_size = (
+                    max(1, num_tokens // bs)
+                    if num_tokens and bs
+                    else self.dllm_config.block_size
+                )
+                metadata_key = (
+                    f"causal_{bs}_bs{block_size}"
+                    if dllm_causal
+                    else f"{bs}_bs{block_size}"
+                )
+            else:
+                metadata_key = bs
             self.prefill_cuda_graph_metadata[metadata_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False

@@ -813,7 +813,11 @@ class FlashAttentionBackend(AttentionBackend):
                 if max_pf > self._pa_swa_max_prefill_len:
                     self._pa_swa_max_prefill_len = max_pf
         elif forward_batch.forward_mode.is_dllm_extend():
-            block_size = self.dllm_config.block_size
+            block_size = (
+                forward_batch.dllm_block_size
+                if forward_batch.dllm_block_size is not None
+                else self.dllm_config.block_size
+            )
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
