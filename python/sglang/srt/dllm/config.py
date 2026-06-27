@@ -124,9 +124,7 @@ class DllmConfig:
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
-        algorithm_config = load_dllm_algorithm_config(
-            server_args.dllm_algorithm_config
-        )
+        algorithm_config = load_dllm_algorithm_config(server_args.dllm_algorithm_config)
         # Parse common algorithm configurations
         block_size = algorithm_config.get("block_size", block_size)
 

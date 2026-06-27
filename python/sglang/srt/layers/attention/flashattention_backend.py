@@ -455,6 +455,7 @@ class FlashAttentionBackend(AttentionBackend):
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
                 dllm_causal=dllm_causal,
+                dllm_block_size=getattr(forward_batch, "dllm_block_size", None),
             )
 
             if forward_mode.is_decode_or_idle() and spec_info is None:
@@ -493,6 +494,7 @@ class FlashAttentionBackend(AttentionBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
                 dllm_causal=dllm_causal,
+                dllm_block_size=getattr(forward_batch, "dllm_block_size", None),
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

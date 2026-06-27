@@ -417,7 +417,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return f"causal_{variant_label}" if variant_label else "causal"
 
     def _num_tokens_for(self, bs: int) -> int:
-        if self._dllm_tiers:
+        if getattr(self, "_dllm_tiers", None):
             return int(self.dllm_config.select_block_size(bs))
         return self.num_tokens_per_bs
 

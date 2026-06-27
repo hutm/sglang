@@ -428,6 +428,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if is_sm100_supported():
+            # Disable CUTLASS backend for piecewise CUDA graphs and DLLM whole-graph
+            # capture due to TMA descriptor initialization issues on SM100 GPUs.
             if (
                 not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 and not self.is_dllm_model

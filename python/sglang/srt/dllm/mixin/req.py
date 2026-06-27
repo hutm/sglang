@@ -54,6 +54,7 @@ class ReqDllmMixin:
         min_required_length = prefix_length + bs
 
         if len(self.full_untruncated_fill_ids) < min_required_length:
+            # still incoming stage
             return
 
         if self.dllm_config.causal_context:

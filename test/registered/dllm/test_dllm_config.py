@@ -3,7 +3,7 @@
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.dllm.config import DllmConfig, load_dllm_algorithm_config
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -98,6 +98,70 @@ class TestSelectBlockSize(unittest.TestCase):
         ]
         cfg = _make_config(tiers=tiers, max_running_requests=128, static_block_size=64)
         self.assertEqual(cfg.block_size, 32)  # max(32, 8)
+
+
+class TestCudaGraphCompatibility(unittest.TestCase):
+    def test_non_dllm_runner_uses_static_token_count(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = object.__new__(DecodeCudaGraphRunner)
+        runner.num_tokens_per_bs = 15
+
+        self.assertEqual(runner._num_tokens_for(64), 15)
+
+    def test_flash_attention_forwards_dynamic_block_size(self):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        backend = object.__new__(FlashAttentionBackend)
+        backend._apply_cuda_graph_metadata = MagicMock()
+        forward_batch = SimpleNamespace(
+            batch_size=4,
+            req_pool_indices=MagicMock(),
+            seq_lens=MagicMock(),
+            encoder_lens=None,
+            forward_mode=MagicMock(),
+            spec_info=None,
+            out_cache_loc=None,
+            seq_lens_sum=0,
+            seq_lens_cpu=MagicMock(),
+            dllm_block_size=16,
+        )
+
+        backend.init_forward_metadata_out_graph(forward_batch)
+
+        self.assertEqual(
+            backend._apply_cuda_graph_metadata.call_args.kwargs["dllm_block_size"],
+            16,
+        )
+
+    def test_flash_attention_tolerates_non_dllm_forward_batch(self):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        backend = object.__new__(FlashAttentionBackend)
+        backend._apply_cuda_graph_metadata = MagicMock()
+        forward_batch = SimpleNamespace(
+            batch_size=4,
+            req_pool_indices=MagicMock(),
+            seq_lens=MagicMock(),
+            encoder_lens=None,
+            forward_mode=MagicMock(),
+            spec_info=None,
+            out_cache_loc=None,
+            seq_lens_sum=0,
+            seq_lens_cpu=MagicMock(),
+        )
+
+        backend.init_forward_metadata_out_graph(forward_batch)
+
+        self.assertIsNone(
+            backend._apply_cuda_graph_metadata.call_args.kwargs["dllm_block_size"]
+        )
 
 
 class TestFromServerArgs(unittest.TestCase):
