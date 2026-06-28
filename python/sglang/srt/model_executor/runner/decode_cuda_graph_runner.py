@@ -43,6 +43,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.graph import DllmGraphPhaseHooks
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -218,6 +219,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
         self.dllm_causal = False
+        self.dllm_graph_phase_hooks = getattr(
+            model_runner, "dllm_graph_phase_hooks", DllmGraphPhaseHooks()
+        )
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
@@ -785,19 +789,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens=bs * self._num_tokens_for(bs),
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    if self.is_dllm:
+                        self.dllm_graph_phase_hooks.before_draft()
+                    try:
+                        self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
-                    if self.is_dllm and self.dllm_config.causal_context:
-                        causal_variant = self._compose_variant_label(
-                            variant_label, True
-                        )
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            causal_variant,
-                            dllm_causal=True,
-                        )
+                        if self.is_dllm and self.dllm_config.causal_context:
+                            self.dllm_graph_phase_hooks.before_verify()
+                            causal_variant = self._compose_variant_label(
+                                variant_label, True
+                            )
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                causal_variant,
+                                dllm_causal=True,
+                            )
+                    finally:
+                        if self.is_dllm:
+                            self.dllm_graph_phase_hooks.after_capture()
 
     def capture_one_shape(
         self,
