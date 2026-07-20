@@ -1796,6 +1796,12 @@ def _fa4_page_constraint(view: Any) -> dict:
         # CUTLASS kernel aborts on at page_size>1. That path only works at
         # page_size==1, so skip the 128 auto-force for it and keep the default.
         and (view.speculative_eagle_topk or 0) <= 1
+        # LinearSpec diffusion decoding accepts partial blocks and therefore
+        # requires page_size==1 (set in ServerArgs for LinearSpec). Forcing 128
+        # here makes the FA4 page-table striding (arange(0, seqlen, page_size))
+        # collapse the DLLM-extend page table to a 2-wide garbage tensor, so
+        # skip the auto-force and keep page_size==1 for LinearSpec.
+        and view.dllm_algorithm not in ("LinearSpec", "linear_spec")
     ):
         logger.warning(
             f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {view.page_size} to 128."
@@ -2096,10 +2102,18 @@ def _dllm_attention_backend(view: Any) -> dict:
                 "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
             )
             return {"attention_backend": "ascend"}
-    elif view.cuda_graph_config.decode.backend != Backend.DISABLED:
-        if view.attention_backend != "flashinfer":
+    elif (
+        view.cuda_graph_config is not None
+        and view.cuda_graph_config.decode.backend != Backend.DISABLED
+    ):
+        # fa4 (FlashAttention-4) also supports the dllm CUDA-graph path and is
+        # faster than flashinfer on SM100, so allow it; anything else falls back.
+        # (No cuda graph -> cuda_graph_config is None and the attention-backend
+        # constraint does not apply, so fall through and keep the user's choice.)
+        if view.attention_backend not in ("flashinfer", "fa4"):
             logger.warning(
-                "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+                "Attention backend must be 'flashinfer' or 'fa4' for diffusion "
+                "LLM inference with CUDA graph; overriding to flashinfer"
             )
             return {"attention_backend": "flashinfer"}
     return {}
@@ -2120,6 +2134,14 @@ def _dllm_overlap_disable(view: Any) -> dict:
 @register_post_process
 def _dllm_page_size(view: Any) -> dict:
     if view.dllm_algorithm is None:
+        return {}
+    # LinearSpec accepts partial blocks, so it addresses KV per position and
+    # needs page_size == 1; the generic block-size alignment below would
+    # otherwise round it up to the dllm block size and corrupt the page table.
+    if view.dllm_algorithm in ("LinearSpec", "linear_spec"):
+        if not view.disable_radix_cache and view.page_size != 1:
+            logger.info("Setting page size to 1 for LinearSpec partial acceptance")
+            return {"page_size": 1}
         return {}
     from sglang.srt.dllm.config import DllmConfig
 

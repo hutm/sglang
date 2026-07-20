@@ -124,5 +124,14 @@ class TestNemotronLabsDiffusionFastDiffuser(
     summary_name = "nemotron-labs-diffusion-8b-fastdiffuser"
 
 
+class TestNemotronLabsDiffusionLinearSpec(
+    NemotronLabsDiffusionTestBase, CustomTestCase
+):
+    algorithm = "LinearSpec"
+    config_name = "nemotron_labs_linearspec.yaml"
+    min_speed = 50
+    summary_name = "nemotron-labs-diffusion-8b-linearspec"
+
+
 if __name__ == "__main__":
     unittest.main()
