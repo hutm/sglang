@@ -1,0 +1,3 @@
+sampler_dir: /path/to/sampler_checkpoint
+threshold: 0.5
+causal_context: true
