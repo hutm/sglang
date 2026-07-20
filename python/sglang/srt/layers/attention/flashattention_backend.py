@@ -16,6 +16,8 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.dllm.attention import get_dllm_causal_attention
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -307,6 +309,11 @@ class FlashAttentionBackend(AttentionBackend):
             _should_disable_scheduler_metadata_precompute(server_args)
         )
 
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm_model = self.dllm_config is not None
+        if self.is_dllm_model:
+            self.dllm_extend_cuda_graph_metadata = {}
+
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
@@ -364,6 +371,7 @@ class FlashAttentionBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -374,7 +382,9 @@ class FlashAttentionBackend(AttentionBackend):
                 encoder_lens,
                 forward_mode,
                 spec_info,
+                req_pool_indices,
                 seq_lens.device,
+                dllm_causal=dllm_causal,
             )
 
             if (
@@ -409,6 +419,7 @@ class FlashAttentionBackend(AttentionBackend):
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
+                dllm_causal=dllm_causal,
             )
 
             if forward_mode.is_decode_or_idle() and spec_info is None:
@@ -446,6 +457,7 @@ class FlashAttentionBackend(AttentionBackend):
                 spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
+                dllm_causal=dllm_causal,
             )
 
     def _init_full_cg_prefill_metadata(
@@ -851,18 +863,28 @@ class FlashAttentionBackend(AttentionBackend):
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
-            if self.is_prefill_aware_swa:
-                self._pa_swa_prefill_lens[
-                    forward_batch.req_pool_indices[:batch_size]
-                ] = forward_batch.seq_lens[:batch_size].to(torch.int32)
-                if seq_lens_cpu is not None:
-                    max_pf = int(seq_lens_cpu[:batch_size].max().item())
-                else:
-                    # Ratchet needs a true upper bound; a local D2H beats
-                    # poisoning it with max_context_len forever.
-                    max_pf = int(forward_batch.seq_lens[:batch_size].max().item())
-                if max_pf > self._pa_swa_max_prefill_len:
-                    self._pa_swa_max_prefill_len = max_pf
+        elif forward_batch.forward_mode.is_dllm_extend():
+            block_size = (
+                forward_batch.dllm_block_size
+                if forward_batch.dllm_block_size is not None
+                else self.dllm_config.block_size
+            )
+            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.page_table = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
+            metadata.max_seq_len_q = block_size
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                batch_size * block_size + 1,
+                block_size,
+                dtype=torch.int32,
+                device=device,
+            )
 
         # Encoder metadata for cross attention. Supports per-request varlen
         # encoder lengths (e.g. MossVL with different image sizes per request).
@@ -1069,6 +1091,12 @@ class FlashAttentionBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
+        causal = get_dllm_causal_attention(
+            layer,
+            forward_batch,
+            self.dllm_config,
+            default_causal=causal,
+        )
 
         # Check if we should use local attention
         use_local_attn = (
@@ -1843,6 +1871,40 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             self._sched_meta_buf = None
 
+        if self.is_dllm_model:
+            # block_size_tiers: one cu_seqlens_q buffer per distinct block_size.
+            # Each buffer holds arange(0, max_bs*b+1, b); values are baked at
+            # alloc time and read fresh at every replay, so per-tier captures
+            # can co-exist without overwriting one another.
+            tiers = getattr(self.dllm_config, "block_size_tiers", None)
+            block_sizes = (
+                sorted({t["block_size"] for t in tiers})
+                if tiers
+                else [self.dllm_config.block_size]
+            )
+            self.dllm_extend_cuda_graph_buffers = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q_by_block_size": {
+                    b: torch.arange(
+                        0,
+                        max_bs * b + 1,
+                        b,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    for b in block_sizes
+                },
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs, max_num_pages, dtype=torch.int32, device=self.device
+                ),
+                "strided_indices": self.decode_cuda_graph_metadata["strided_indices"],
+            }
+
         # Only allocate local attention buffers if local attention is enabled
         # This prevents OOM errors when local attention is not being used
         if self.has_local_attention:
@@ -2128,7 +2190,9 @@ class FlashAttentionBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        req_pool_indices: torch.Tensor,
         device: torch.device,
+        dllm_causal: bool = False,
     ) -> tuple:
         """Create FlashAttentionMetadata with pre-allocated buffer slice refs.
 
@@ -2320,6 +2384,55 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
             self.draft_extend_metadata[bs] = metadata
 
+        elif forward_mode.is_dllm_extend():
+            block_size = (
+                max(1, num_tokens // bs)
+                if num_tokens and bs
+                else self.dllm_config.block_size
+            )
+            max_pool_len = self.req_to_token.shape[1]
+            _GRID_SATURATION_PREFIX = 8192
+            capture_prefix_len = min(_GRID_SATURATION_PREFIX, max_pool_len - block_size)
+            capture_seq_len = capture_prefix_len + block_size
+            capture_seq_lens = torch.full(
+                (bs,), capture_seq_len, dtype=torch.int32, device=device
+            )
+            max_seq_pages = (capture_seq_len + self.page_size - 1) // self.page_size
+
+            metadata.cache_seqlens_int32 = self.dllm_extend_cuda_graph_buffers[
+                "cache_seqlens"
+            ][:bs]
+            metadata.cu_seqlens_k = self.dllm_extend_cuda_graph_buffers["cu_seqlens_k"][
+                : bs + 1
+            ]
+            # Use full-width page_table (same pattern as normal decode) so replay can
+            # update any number of pages up to max_num_pages without resizing.
+            metadata.page_table = self.dllm_extend_cuda_graph_buffers["page_table"][
+                :bs, :
+            ]
+            metadata.max_seq_len_q = block_size
+            metadata.cu_seqlens_q = self.dllm_extend_cuda_graph_buffers[
+                "cu_seqlens_q_by_block_size"
+            ][block_size][: bs + 1]
+
+            normal_decode_set_metadata(
+                metadata.cache_seqlens_int32,
+                metadata.cu_seqlens_k,
+                metadata.page_table,
+                self.req_to_token,
+                req_pool_indices,
+                self.dllm_extend_cuda_graph_buffers["strided_indices"][:max_seq_pages],
+                max_seq_pages,
+                capture_seq_lens,
+                0,
+                self.page_size,
+            )
+            metadata.max_seq_len_k = capture_seq_len
+            metadata_key = (
+                f"causal_{bs}_bs{block_size}" if dllm_causal else f"{bs}_bs{block_size}"
+            )
+            self.dllm_extend_cuda_graph_metadata[metadata_key] = metadata
+
         if encoder_lens is not None:
             encoder_bs = encoder_lens.numel()
             metadata.encoder_lens_int32 = self.encoder_metadata["encoder_lens_int32"][
@@ -2361,6 +2474,8 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
+        dllm_causal: bool = False,
+        **kwargs,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -2387,6 +2502,36 @@ class FlashAttentionBackend(AttentionBackend):
             self.swa_out_cache_loc_buf[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
+
+        if forward_mode.is_dllm_extend():
+            block_size = kwargs.get("dllm_block_size") or self.dllm_config.block_size
+            metadata_key = (
+                f"causal_{bs}_bs{block_size}" if dllm_causal else f"{bs}_bs{block_size}"
+            )
+            metadata = self.dllm_extend_cuda_graph_metadata[metadata_key]
+            max_seq_len_k = int(seq_lens_cpu.max().item())
+            max_seq_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
+            assert_buffer_fits(
+                max_seq_pages,
+                metadata.page_table.shape[1],
+                "FA4 DLLM page_table",
+            )
+            normal_decode_set_metadata(
+                metadata.cache_seqlens_int32,
+                metadata.cu_seqlens_k,
+                metadata.page_table,
+                self.req_to_token,
+                req_pool_indices,
+                self.dllm_extend_cuda_graph_buffers["strided_indices"][:max_seq_pages],
+                max_seq_pages,
+                seq_lens,
+                0,
+                self.page_size,
+            )
+            metadata.max_seq_len_k = max_seq_len_k
+            self.forward_metadata = metadata
+            self.forward_metadata_spec_decode_expand = metadata_expand
+            return
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
