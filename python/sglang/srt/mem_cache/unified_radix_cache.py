@@ -635,6 +635,59 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
+    def import_prefix(
+        self,
+        key: RadixKey,
+        page_ids: torch.Tensor,
+        cached_prefix_pages: int = 0,
+        claimed: bool = False,
+    ) -> int:
+        """Adopt KV that already sits in ``page_ids`` as a cached prefix.
+
+        For KV produced outside this cache: memory that outlived a previous
+        engine process, a restored snapshot, or a transfer that wrote straight
+        into these pages. ``key`` must span exactly ``len(page_ids)`` full
+        pages. The pages are taken from the allocator and inserted unlocked,
+        so they are evictable like any finished request's prefix; where the
+        tree already caches part of ``key``, the insert frees the duplicate
+        pages.
+
+        ``cached_prefix_pages`` leading pages were adopted by an earlier call
+        and are already in the tree; they are neither claimed again nor freed
+        as duplicates. This adopts a tree of prefixes one leaf at a time.
+
+        With ``claimed``, the caller already took the other pages from the
+        allocator (e.g. a whole tree's pages in one ``alloc_pages`` call), and
+        a ``page_ids`` on the cache's device makes the import sync-free.
+
+        Returns the number of tokens of ``key`` now cached, or 0 if the cache
+        is disabled or any page is not free.
+        """
+        if self.disable:
+            return 0
+        page_size = int(self.page_size)
+        if len(key) != int(page_ids.numel()) * page_size:
+            raise ValueError(
+                f"key spans {len(key)} tokens but {int(page_ids.numel())} pages "
+                f"of {page_size} tokens were given"
+            )
+        allocator = self.token_to_kv_pool_allocator
+        if (
+            not claimed
+            and allocator.alloc_pages(page_ids[cached_prefix_pages:]) is None
+        ):
+            return 0
+        page_ids = page_ids.to(device=allocator.device, dtype=torch.int64)
+        offsets = torch.arange(page_size, dtype=torch.int64, device=page_ids.device)
+        self.insert(
+            InsertParams(
+                key=key,
+                value=(page_ids[:, None] * page_size + offsets).reshape(-1),
+                prev_prefix_len=cached_prefix_pages * page_size,
+            )
+        )
+        return len(key)
+
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)

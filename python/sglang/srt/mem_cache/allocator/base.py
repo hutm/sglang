@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Hashable, Protocol
+from typing import TYPE_CHECKING, Hashable, Optional, Protocol
 
 import torch
 
@@ -203,6 +203,42 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
         """Take ownership before a caller can mutate a deferred tensor view."""
         return free_index.clone()
+
+    def alloc_pages(self, page_ids: torch.Tensor) -> Optional[torch.Tensor]:
+        """Allocate exactly the pages ``page_ids``, e.g. pages that already
+        hold KV produced outside the scheduler.
+
+        Returns their token indices (page by page, in ``page_ids`` order), or
+        None and no change when any page is not free or appears twice.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support allocating specific pages"
+        )
+
+    def _alloc_pages_from_free_list(
+        self, page_ids: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """``alloc_pages`` for allocators that keep free pages in ``free_pages``.
+
+        The membership checks run on the host, on one copy of the free list:
+        on the device, ``isin`` and ``unique`` launch sort kernels whose first
+        use in a process can take seconds (lazy module loading)."""
+        if self.free_group is not None:
+            raise RuntimeError("cannot allocate specific pages inside a free group")
+        ids = page_ids.to(device="cpu", dtype=torch.int64).reshape(-1)
+        if ids.numel() == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        if torch.unique(ids).numel() != ids.numel():
+            return None
+        self.merge_and_sort_free()
+        free = self.free_pages.cpu()
+        taken = torch.isin(free, ids)
+        if int(taken.sum()) != ids.numel():
+            return None
+        self.free_pages = free[~taken].to(self.device)
+        page_ids = ids.to(self.device)
+        offsets = torch.arange(self.page_size, dtype=torch.int64, device=self.device)
+        return (page_ids[:, None] * self.page_size + offsets).reshape(-1)
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
