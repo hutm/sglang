@@ -1,6 +1,7 @@
 import logging
 from abc import ABC
 from contextlib import contextmanager
+from typing import Callable, Dict
 
 from sglang.srt.utils.common import is_xpu
 
@@ -24,9 +25,49 @@ logger = logging.getLogger(__name__)
 _warned_xpu_cuda_graph = False
 
 
+DEFAULT_MEMORY_SAVER_BACKEND = "torch_memory_saver"
+
+# name -> factory returning an adapter instance. Plugins register additional
+# backends from a ``sglang.srt.plugins`` entry point.
+_backends: Dict[str, Callable[[], "TorchMemorySaverAdapter"]] = {}
+
+
+def register_memory_saver_backend(
+    name: str, factory: Callable[[], "TorchMemorySaverAdapter"]
+) -> None:
+    """Register a memory-saver backend selectable with ``--memory-saver-backend``.
+
+    A backend owns the memory allocated inside ``region(tag)`` and implements
+    ``pause``/``resume`` for it, e.g. to back regions with memory that another
+    process owns or that survives the engine process.
+    """
+    if name in _backends:
+        raise ValueError(f"memory saver backend {name!r} is already registered")
+    _backends[name] = factory
+
+
+def _configured_backend() -> str:
+    try:
+        from sglang.srt.runtime_context import get_exec
+
+        return get_exec().features.memory_saver_backend
+    except (ValueError, AttributeError):
+        # Config not published yet (e.g. standalone use): default backend.
+        return DEFAULT_MEMORY_SAVER_BACKEND
+
+
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
     def create(enable: bool):
+        if enable:
+            backend = _configured_backend()
+            if backend != DEFAULT_MEMORY_SAVER_BACKEND:
+                if backend not in _backends:
+                    raise ValueError(
+                        f"unknown memory saver backend {backend!r}; registered: "
+                        f"{sorted(_backends)}"
+                    )
+                return _backends[backend]()
         if enable and import_error is not None:
             if is_xpu():
                 # XPU ships no prebuilt wheel; it is built from source against the
@@ -50,6 +91,12 @@ class TorchMemorySaverAdapter(ABC):
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )
+
+    def allocation_preserves_contents(self, tag: str) -> bool:
+        """Whether memory handed out inside the current ``region(tag)``
+        already holds valid contents, e.g. memory re-attached from another
+        process. Pools then allocate without zero-filling it."""
+        return False
 
     def check_validity(self, caller_name):
         if not self.enabled:
@@ -162,3 +209,8 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
     @property
     def enabled(self):
         return False
+
+
+register_memory_saver_backend(
+    DEFAULT_MEMORY_SAVER_BACKEND, lambda: TorchMemorySaverAdapter.create(enable=True)
+)

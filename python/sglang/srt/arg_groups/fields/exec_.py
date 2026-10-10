@@ -81,6 +81,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
     ] = False
+    memory_saver_backend: A[
+        str,
+        "Memory saver backend used with --enable-memory-saver. 'torch_memory_saver' (default) or a backend registered by a plugin with register_memory_saver_backend.",
+    ] = "torch_memory_saver"
     enable_custom_logit_processor: A[
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
