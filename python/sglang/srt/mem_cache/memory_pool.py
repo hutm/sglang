@@ -376,6 +376,17 @@ def _resolve_fused_scale(
     return None
 
 
+def _kv_buffer_alloc(memory_saver_adapter) -> Callable[..., torch.Tensor]:
+    """Allocator for KV buffers created inside the KV cache region.
+
+    Zero-fills unless the memory saver backend hands back memory that already
+    holds valid KV (``allocation_preserves_contents``).
+    """
+    if memory_saver_adapter.allocation_preserves_contents(GPU_MEMORY_TYPE_KV_CACHE):
+        return torch.empty
+    return torch.zeros
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -2550,6 +2561,7 @@ class MHATokenToKVPool(KVCache, MHAKVView):
 
     def _create_buffers_normal(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            alloc = _kv_buffer_alloc(self.memory_saver_adapter)
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
@@ -2562,7 +2574,7 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                     x = self._kv_vector_x
                     # K: (num_blocks, H, D_k // X, page, X)
                     self.k_buffer = [
-                        torch.zeros(
+                        alloc(
                             (
                                 num_blocks,
                                 self.head_num,
@@ -2577,7 +2589,7 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                     ]
                     # V: (num_blocks, H, page // X, D_v, X)
                     self.v_buffer = [
-                        torch.zeros(
+                        alloc(
                             (
                                 num_blocks,
                                 self.head_num,
@@ -2593,10 +2605,8 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                 else:
                     k_shape, v_shape = self._kv_buffer_shapes()
 
-                    def _zeros(shape):
-                        return torch.zeros(
-                            shape, dtype=self.store_dtype, device=self.device
-                        )
+                    def _kv_buffer(shape):
+                        return alloc(shape, dtype=self.store_dtype, device=self.device)
 
                     # Only CUDA's trtllm fmha_v2 prefill reads the fused layout,
                     # and same-node Mooncake PD on ROCm decodes garbage when V
@@ -2620,14 +2630,18 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                             rows if self.use_hnd else ceil_align(rows, self.page_size)
                         )
                         fused = [
-                            _zeros((2, padded, *k_shape[1:]))
+                            _kv_buffer((2, padded, *k_shape[1:]))
                             for _ in range(self.layer_num)
                         ]
                         self.k_buffer = [buf[0, :rows] for buf in fused]
                         self.v_buffer = [buf[1, :rows] for buf in fused]
                     else:
-                        self.k_buffer = [_zeros(k_shape) for _ in range(self.layer_num)]
-                        self.v_buffer = [_zeros(v_shape) for _ in range(self.layer_num)]
+                        self.k_buffer = [
+                            _kv_buffer(k_shape) for _ in range(self.layer_num)
+                        ]
+                        self.v_buffer = [
+                            _kv_buffer(v_shape) for _ in range(self.layer_num)
+                        ]
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
@@ -4755,8 +4769,9 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                alloc = _kv_buffer_alloc(self.memory_saver_adapter)
                 self.kv_buffer = [
-                    torch.zeros(
+                    alloc(
                         (self.size + self.page_size, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
