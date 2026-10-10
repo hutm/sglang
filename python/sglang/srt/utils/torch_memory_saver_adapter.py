@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 _warned_xpu_cuda_graph = False
 
+# Tags whose regions are created with CPU backup regardless of the caller's
+# ``enable_cpu_backup`` argument, so their contents survive pause/resume.
+_cpu_backup_tags: frozenset = frozenset()
+
 
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
@@ -50,6 +54,19 @@ class TorchMemorySaverAdapter(ABC):
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )
+
+    @staticmethod
+    def set_cpu_backup_tags(tags) -> None:
+        """Back up every region created with one of ``tags`` to CPU memory, so
+        ``pause``/``resume`` preserves its contents. Process-wide; set it before
+        the tagged regions are created."""
+        global _cpu_backup_tags
+        _cpu_backup_tags = frozenset(tags)
+
+    def preserves_contents(self, tag: str) -> bool:
+        """Whether memory under ``tag`` keeps its contents across
+        ``pause(tag)``/``resume(tag)``."""
+        return False
 
     def check_validity(self, caller_name):
         if not self.enabled:
@@ -98,7 +115,12 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return torch_memory_saver.configure_subprocess()
 
     def region(self, tag: str, enable_cpu_backup: bool = False):
-        return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+        return _memory_saver.region(
+            tag=tag, enable_cpu_backup=enable_cpu_backup or tag in _cpu_backup_tags
+        )
+
+    def preserves_contents(self, tag: str) -> bool:
+        return tag in _cpu_backup_tags
 
     def cuda_graph(self, **kwargs):
         if is_xpu():
