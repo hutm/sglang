@@ -3407,6 +3407,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("sglang.srt.managers.schedule_batch", "Modality"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
+        ("sglang.srt.weight_sync.vmm_fd", "rebuild_vmm_fd_tensor"),
         (
             "sglang.srt.model_executor.model_runner_components.weight_updater",
             "LocalSerializedTensor",
