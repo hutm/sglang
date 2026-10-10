@@ -1916,6 +1916,10 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+    # Transport the daemon exports weights with: "torch_ipc" (legacy CUDA IPC)
+    # or "vmm_fd" (one exportable CUDA VMM allocation shared by POSIX fd; the
+    # clients' mappings stay valid if the daemon exits).
+    SGLANG_WEIGHT_CACHE_TRANSPORT = EnvStr("torch_ipc")
 
 
 envs = Envs()

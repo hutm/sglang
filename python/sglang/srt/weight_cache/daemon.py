@@ -452,8 +452,17 @@ class WeightCacheDaemon:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
+        previous_backend = self.transport_backend
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        if hasattr(self.transport_backend, "tensor_for_entry"):
+            # The backend exported a copy; serve from it so the daemon does
+            # not hold every weight twice.
+            self._rebind_to_exported(state_tensors)
+        del state_tensors
+        if previous_backend is not None and hasattr(previous_backend, "close"):
+            previous_backend.close()
+        torch.cuda.empty_cache()
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
@@ -470,6 +479,16 @@ class WeightCacheDaemon:
             f"transport={self.transport_backend.name}, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
+
+    def _rebind_to_exported(self, state_tensors) -> None:
+        params = dict(self.model.named_parameters(remove_duplicate=False))
+        buffers = dict(self.model.named_buffers(remove_duplicate=False))
+        for name in state_tensors:
+            exported = self.transport_backend.tensor_for_entry(self.state_entries[name])
+            if name in params:
+                params[name].data = exported
+            elif name in buffers:
+                buffers[name].data = exported
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
         """Build the same initial physical expert layout as the engine."""
