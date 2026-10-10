@@ -2126,6 +2126,10 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
+    # Whether releasing `kv_cache` flushes the radix cache. None flushes unless
+    # the memory saver preserves KV contents (--enable-kv-cache-cpu-backup).
+    # False keeps the radix cache and is honored only when contents survive.
+    flush_cache: Optional[bool] = None
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):

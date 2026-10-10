@@ -318,6 +318,22 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
 
+    def _release_flushes_cache(self, flush_cache: Optional[bool]) -> bool:
+        """Whether releasing the KV cache must flush the radix cache."""
+        preserved = self.memory_saver_adapter.preserves_contents(
+            GPU_MEMORY_TYPE_KV_CACHE
+        )
+        if flush_cache is None:
+            return not preserved
+        if not flush_cache and not preserved:
+            logger.warning(
+                "release_memory_occupation(flush_cache=False) ignored: the KV "
+                "cache is not preserved across release (see "
+                "--enable-kv-cache-cpu-backup); flushing the radix cache."
+            )
+            return True
+        return flush_cache
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
         assert self.is_fully_idle(
@@ -347,7 +363,8 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
-            self.flush_cache()
+            if self._release_flushes_cache(recv_req.flush_cache):
+                self.flush_cache()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
