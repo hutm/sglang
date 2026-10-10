@@ -635,6 +635,34 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
+    def import_prefix(self, key: RadixKey, page_ids: torch.Tensor) -> int:
+        """Adopt KV that already sits in ``page_ids`` as a cached prefix.
+
+        For KV produced outside this cache: memory that outlived a previous
+        engine process, a restored snapshot, or a transfer that wrote straight
+        into these pages. ``key`` must span exactly ``len(page_ids)`` full
+        pages. The pages are taken from the allocator and inserted unlocked,
+        so they are evictable like any finished request's prefix; where the
+        tree already caches part of ``key``, the insert frees the duplicate
+        pages.
+
+        Returns the number of tokens of ``key`` now cached, or 0 if the cache
+        is disabled or any page is not free.
+        """
+        if self.disable:
+            return 0
+        page_size = int(self.page_size)
+        if len(key) != int(page_ids.numel()) * page_size:
+            raise ValueError(
+                f"key spans {len(key)} tokens but {int(page_ids.numel())} pages "
+                f"of {page_size} tokens were given"
+            )
+        indices = self.token_to_kv_pool_allocator.alloc_pages(page_ids)
+        if indices is None:
+            return 0
+        self.insert(InsertParams(key=key, value=indices))
+        return len(key)
+
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
