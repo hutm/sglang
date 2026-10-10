@@ -486,6 +486,7 @@ POSITIONAL_FIELD_ORDER = (
     "debug_tensor_dump_layers",
     "debug_tensor_dump_input_file",
     "enable_memory_saver",
+    "memory_saver_backend",
     "enable_weights_cpu_backup",
     "enable_draft_weights_cpu_backup",
     "enable_kv_cache_cpu_backup",
