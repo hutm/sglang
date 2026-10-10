@@ -201,6 +201,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return out_indices
 
+    def alloc_pages(self, page_ids: torch.Tensor):
+        return self._alloc_pages_from_free_list(page_ids)
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
