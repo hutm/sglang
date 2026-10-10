@@ -65,6 +65,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
     ] = False
+    memory_saver_backend: A[
+        str,
+        "Memory saver backend used with --enable-memory-saver. 'torch_memory_saver' (default) or a backend registered by a plugin with register_memory_saver_backend.",
+    ] = "torch_memory_saver"
     enable_kv_cache_cpu_backup: A[
         bool,
         "Save the KV cache to CPU memory during release_memory_occupation and restore it on resume_memory_occupation, so the radix cache stays valid. Requires --enable-memory-saver.",
