@@ -36,6 +36,7 @@ from sglang.srt.configs.model_config import (
     ModelImpl,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import bootstrap
 from sglang.srt.dllm.config import DllmConfig
@@ -700,8 +701,15 @@ class ModelRunner:
         self.configure_kv_cache_dtype()
 
     def init_memory_saver_adapter(self):
+        features = get_exec().features
+        if features.enable_kv_cache_cpu_backup:
+            if not features.enable_memory_saver:
+                raise ValueError(
+                    "--enable-kv-cache-cpu-backup requires --enable-memory-saver"
+                )
+            TorchMemorySaverAdapter.set_cpu_backup_tags({GPU_MEMORY_TYPE_KV_CACHE})
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=get_exec().features.enable_memory_saver
+            enable=features.enable_memory_saver
         )
 
     def maybe_init_remote_instance_transfer_engine(self):

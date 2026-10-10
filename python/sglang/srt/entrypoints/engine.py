@@ -1805,8 +1805,10 @@ class Engine(EngineScoreMixin, EngineBase):
 
         return await self.tokenizer_manager.unload_lora_adapter(obj, None)
 
-    def release_memory_occupation(self, tags: Optional[List[str]] = None):
-        obj = ReleaseMemoryOccupationReqInput(tags=tags)
+    def release_memory_occupation(
+        self, tags: Optional[List[str]] = None, flush_cache: Optional[bool] = None
+    ):
+        obj = ReleaseMemoryOccupationReqInput(tags=tags, flush_cache=flush_cache)
         return self.loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )

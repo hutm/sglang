@@ -65,6 +65,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
     ] = False
+    enable_kv_cache_cpu_backup: A[
+        bool,
+        "Save the KV cache to CPU memory during release_memory_occupation and restore it on resume_memory_occupation, so the radix cache stays valid. Requires --enable-memory-saver.",
+    ] = False
     enable_custom_logit_processor: A[
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
