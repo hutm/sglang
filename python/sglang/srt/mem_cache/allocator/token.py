@@ -73,6 +73,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.free_group is None:
+            free_index = self._divert_withheld(free_index)
             self._notify_released(free_index)
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))

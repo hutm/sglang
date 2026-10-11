@@ -13,9 +13,7 @@ Session protocol on one persistent connection (the open connection is the
 writer lease; only one engine writes to a pool at a time):
 
     engine -> {"type": "kv_attach", "key": {...}, "role": r, "wait_s": t}
-    writer: daemon -> {"status": "restore", "buffers": [desc...], "directory": [...],
-                       "live": [...], "writer_gone_s": s, "token_capacity": n}
-                      followed by one fd per buffer, or
+    writer: daemon -> {"status": "restore", <handover>} + one fd per buffer, or
                       {"status": "fresh"} / {"status": "busy"}
     standby: daemon -> {"status": "standby", "buffers": [...], "token_capacity": n}
                        + fds (waits up to wait_s for a writer to deposit), or
@@ -26,24 +24,23 @@ writer lease; only one engine writes to a pool at a time):
             engine -> {"type": "kv_evict", "page_ids": [...]}
             engine -> {"type": "kv_clear"}
             engine -> {"type": "kv_live", "add": [...], "remove": [...], "reset": b}
-    standby: engine -> {"type": "kv_promote", "timeout_s": t}
-             daemon -> {"status": "promoted", "directory": [...], "live": [...],
-                        "writer_gone_s": s} (the session is now the writer), or
-                       {"status": "timeout"} (still a standby)
+    standby: engine -> {"type": "kv_promote"}
+             daemon -> {"status": "promoted", <handover>}; the session is the writer
+    to a writer that inherited from a live predecessor:
+            daemon -> {"type": "kv_quarantine", "pages": [...]}
+            daemon -> {"type": "kv_old_writer_gone"}
+
+<handover> is {"buffers", "token_capacity", "directory", "live",
+"old_writer_alive", "writer_gone_s"}: the committed directory, the pages the
+previous writers allocated but did not commit, whether one of them is still
+connected, and else how long ago the last one disconnected.
 
 A standby maps the pool but never writes to it: its allocator holds every page
-until promotion. Promotion waits until no writer session is alive (the
-orchestrator fenced the old writer; its EOF may lag). The live set is the
-pages a writer allocated but has not freed, reported before the forward that
-writes them runs; the next writer quarantines the uncommitted ones until the
-old writer is gone for a grace period, in case its GPU work is still running.
-
-A page entry is ``(page_id, parent_page_id, token_ids, extra_key,
-cache_salt)``; ``parent_page_id`` is -1 for a page at the root. Commits are
-sent when the radix cache inserts the pages, after the forward that wrote
-them has finished. Evictions are sent before the pages can be reallocated,
-and stream ordering makes the daemon apply them even if the engine dies
-right after.
+until promotion. Promotion does not wait for the writer to go: it fences it
+(revokes the lease at once). A fenced writer may still be running GPU work, so
+its uncommitted pages, any page it allocates later and any page it evicts later
+are quarantined by the new writer: kept out of reuse until the fenced session
+has ended plus a grace period. Its later commits are ignored.
 """
 
 from __future__ import annotations
@@ -80,6 +77,26 @@ def buffer_desc(shape, dtype: torch.dtype, nbytes: int) -> BufferDesc:
 # ===== Daemon side =====
 
 
+class _Session:
+    """One engine connection; ``live`` is what it allocated and not freed."""
+
+    def __init__(self, conn: socket.socket):
+        self.conn = conn
+        self.send_lock = threading.Lock()
+        self.live: Set[int] = set()
+        # Predecessors' pages this writer took over in quarantine; passed on
+        # if it dies before they were surely released.
+        self.inherited: Set[int] = set()
+        self.fenced = False
+
+    def notify(self, msg: Dict[str, Any]) -> None:
+        try:
+            with self.send_lock:
+                send_msg(self.conn, msg)
+        except OSError as e:
+            logger.warning(f"[KvRestore] could not notify the writer: {e}")
+
+
 class _KvPool(msgspec.Struct):
     key: Dict[str, Any]
     fds: List[int] = []
@@ -87,17 +104,17 @@ class _KvPool(msgspec.Struct):
     complete: bool = False
     token_capacity: int = 0
     directory: Dict[int, PageEntry] = {}
-    leased: bool = False
-    # Pages the current writer allocated and has not freed.
-    live: Set[int] = set()
-    # The last writer's live pages and when its session ended (monotonic).
+    writer: Optional[_Session] = None
+    # Writers whose lease was revoked by a promotion but still connected.
+    fenced: List[_Session] = []
+    # The last writer that disconnected: its live pages and when (monotonic).
     last_writer_live: Set[int] = set()
     last_writer_eof: Optional[float] = None
 
 
 class KvRestoreStore:
-    """The daemon's KV pool: buffer fds, page directory, live pages and the
-    writer lease.
+    """The daemon's KV pool: buffer fds, page directory, the writer lease and
+    the writers it fenced.
 
     Holds plain fds only; the daemon makes no CUDA calls for KV.
     """
@@ -108,30 +125,35 @@ class KvRestoreStore:
 
     def serve_session(self, conn: socket.socket, attach: Dict[str, Any]) -> None:
         """Run one engine's session until it disconnects. Owns ``conn``."""
+        session = _Session(conn)
         try:
             if attach.get("role", "writer") == "standby":
-                pool = self._attach_standby(conn, attach)
+                pool = self._attach_standby(session, attach)
                 if pool is not None:
-                    self._standby_loop(conn, pool)
+                    self._standby_loop(session, pool)
             else:
-                pool = self._attach(conn, attach["key"])
+                pool = self._attach(session, attach["key"])
                 if pool is not None:
-                    self._session_loop(conn, pool)
+                    self._session_loop(session, pool)
         except (ConnectionError, OSError) as e:
             logger.info(f"[KvRestore] session ended: {e}")
         finally:
             conn.close()
 
-    def _attach(self, conn: socket.socket, key: Dict[str, Any]) -> Optional[_KvPool]:
+    def _attach(self, session: _Session, key: Dict[str, Any]) -> Optional[_KvPool]:
+        conn = session.conn
         with self._cond:
             pool = self._pool
-            if pool is not None and pool.leased:
+            if pool is not None and pool.writer is not None:
                 send_msg(conn, {"status": "busy"})
                 return None
             if pool is not None and pool.complete and pool.key == key:
-                pool.leased = True
-                send_msg(conn, {"status": "restore", **self._handover(pool)})
-                self._send_fds(conn, pool)
+                pool.writer = session
+                handover = self._handover(pool)
+                session.inherited = set(handover["live"])
+                with session.send_lock:
+                    send_msg(conn, {"status": "restore", **handover})
+                    self._send_fds(conn, pool)
                 logger.info(
                     f"[KvRestore] restoring {len(pool.fds)} KV buffers and "
                     f"{len(pool.directory)} cached pages"
@@ -139,15 +161,16 @@ class KvRestoreStore:
                 return pool
             if pool is not None:
                 self._close_pool(pool)
-            pool = _KvPool(key=key, leased=True)
+            pool = _KvPool(key=key, writer=session)
             self._pool = pool
             send_msg(conn, {"status": "fresh"})
             return pool
 
     def _attach_standby(
-        self, conn: socket.socket, attach: Dict[str, Any]
+        self, session: _Session, attach: Dict[str, Any]
     ) -> Optional[_KvPool]:
         """Map-only attach: wait for a complete pool with this key."""
+        conn = session.conn
         key = attach["key"]
         deadline = time.monotonic() + attach.get("wait_s", 1800.0)
         with self._cond:
@@ -174,45 +197,47 @@ class KvRestoreStore:
                     return None
                 self._cond.wait(timeout=remaining)
 
-    def _standby_loop(self, conn: socket.socket, pool: _KvPool) -> None:
-        conn.settimeout(None)
-        while True:
-            msg = recv_msg(conn)
-            if msg["type"] != "kv_promote":
-                raise ValueError(f"standby sent {msg['type']!r}")
-            if self._promote(conn, pool, msg["timeout_s"]):
-                break
-        self._session_loop(conn, pool)
-
-    def _promote(self, conn: socket.socket, pool: _KvPool, timeout_s: float) -> bool:
-        deadline = time.monotonic() + timeout_s
+    def _standby_loop(self, session: _Session, pool: _KvPool) -> None:
+        session.conn.settimeout(None)
+        msg = recv_msg(session.conn)
+        if msg["type"] != "kv_promote":
+            raise ValueError(f"standby sent {msg['type']!r}")
         with self._cond:
-            while pool.leased or self._pool is not pool:
-                remaining = deadline - time.monotonic()
-                if self._pool is not pool or remaining <= 0:
-                    send_msg(conn, {"status": "timeout"})
-                    return False
-                self._cond.wait(timeout=remaining)
-            pool.leased = True
-            send_msg(conn, {"status": "promoted", **self._handover(pool)})
+            if self._pool is not pool:
+                send_msg(session.conn, {"status": "pool_gone"})
+                return
+            old = pool.writer
+            if old is not None:
+                # Revoke the lease now; the old writer may be frozen, not dead.
+                old.fenced = True
+                pool.fenced.append(old)
+            pool.writer = session
+            handover = self._handover(pool)
+            session.inherited = set(handover["live"])
+            with session.send_lock:
+                send_msg(session.conn, {"status": "promoted", **handover})
             logger.info(
                 f"[KvRestore] standby promoted with {len(pool.directory)} cached "
-                f"pages; {len(pool.last_writer_live)} pages were live"
+                f"pages; {len(pool.fenced)} fenced writers still connected"
             )
-            return True
+        self._session_loop(session, pool)
 
     @staticmethod
     def _handover(pool: _KvPool) -> Dict[str, Any]:
-        """Directory and quarantine inputs for a new writer of ``pool``."""
+        """What a new writer of ``pool`` adopts and quarantines."""
+        live = set(pool.last_writer_live)
+        for old in pool.fenced:
+            live |= old.live
         gone = None
-        if pool.last_writer_eof is not None:
+        if not pool.fenced and pool.last_writer_eof is not None:
             gone = time.monotonic() - pool.last_writer_eof
         return {
             "buffers": list(pool.descs),
-            "directory": list(pool.directory.values()),
-            "live": sorted(pool.last_writer_live - pool.directory.keys()),
-            "writer_gone_s": gone,
             "token_capacity": pool.token_capacity,
+            "directory": list(pool.directory.values()),
+            "live": sorted(live - pool.directory.keys()),
+            "old_writer_alive": bool(pool.fenced),
+            "writer_gone_s": gone,
         }
 
     @staticmethod
@@ -220,49 +245,87 @@ class KvRestoreStore:
         for index, fd in enumerate(pool.fds):
             _send_fd(conn, fd, index)
 
-    def _session_loop(self, conn: socket.socket, pool: _KvPool) -> None:
+    def _session_loop(self, session: _Session, pool: _KvPool) -> None:
+        conn = session.conn
         conn.settimeout(None)
-        pool.live = set()
         try:
             while True:
                 msg = recv_msg(conn)
-                kind = msg["type"]
                 with self._cond:
-                    if kind == "kv_commit":
-                        for entry in msg["pages"]:
-                            pool.directory[entry[0]] = tuple(entry)
-                    elif kind == "kv_evict":
-                        for page_id in msg["page_ids"]:
-                            pool.directory.pop(page_id, None)
-                    elif kind == "kv_clear":
-                        pool.directory.clear()
-                    elif kind == "kv_live":
-                        if msg.get("reset"):
-                            pool.live.clear()
-                        pool.live.difference_update(msg["remove"])
-                        pool.live.update(msg["add"])
-                    elif kind == "kv_deposit":
-                        _, fd = _recv_fd(conn)
-                        pool.fds.append(fd)
-                        pool.descs.append(tuple(msg["desc"]))
-                    elif kind == "kv_layout_done":
-                        pool.complete = msg["count"] == len(pool.fds)
-                        pool.token_capacity = msg["token_capacity"]
-                        self._cond.notify_all()
+                    if session.fenced:
+                        self._apply_fenced(session, pool, msg)
                     else:
-                        raise ValueError(f"unknown KV restore message {kind!r}")
+                        self._apply(session, pool, msg)
         finally:
             with self._cond:
-                pool.leased = False
-                pool.last_writer_live = pool.live
-                pool.live = set()
-                pool.last_writer_eof = time.monotonic()
-                if not pool.complete:
-                    # Died while depositing: the layout is unusable.
-                    self._close_pool(pool)
-                    if self._pool is pool:
-                        self._pool = None
-                self._cond.notify_all()
+                self._end_session(session, pool)
+
+    def _apply(self, session: _Session, pool: _KvPool, msg: Dict[str, Any]) -> None:
+        kind = msg["type"]
+        if kind == "kv_commit":
+            for entry in msg["pages"]:
+                pool.directory[entry[0]] = tuple(entry)
+        elif kind == "kv_evict":
+            for page_id in msg["page_ids"]:
+                pool.directory.pop(page_id, None)
+        elif kind == "kv_clear":
+            pool.directory.clear()
+        elif kind == "kv_live":
+            if msg.get("reset"):
+                session.live.clear()
+            session.live.difference_update(msg["remove"])
+            session.live.update(msg["add"])
+        elif kind == "kv_deposit":
+            _, fd = _recv_fd(session.conn)
+            pool.fds.append(fd)
+            pool.descs.append(tuple(msg["desc"]))
+        elif kind == "kv_layout_done":
+            pool.complete = msg["count"] == len(pool.fds)
+            pool.token_capacity = msg["token_capacity"]
+            self._cond.notify_all()
+        else:
+            raise ValueError(f"unknown KV restore message {kind!r}")
+
+    def _apply_fenced(
+        self, session: _Session, pool: _KvPool, msg: Dict[str, Any]
+    ) -> None:
+        """A fenced writer's late messages: its evictions still leave the
+        directory, and what it evicts or allocates is quarantined by the
+        current writer; its commits are ignored."""
+        kind = msg["type"]
+        pages: List[int] = []
+        if kind == "kv_evict":
+            pages = list(msg["page_ids"])
+            for page_id in pages:
+                pool.directory.pop(page_id, None)
+        elif kind == "kv_live":
+            pages = list(msg["add"])
+            session.live.update(pages)
+        elif kind == "kv_deposit":
+            os.close(_recv_fd(session.conn)[1])
+        if pages and pool.writer is not None:
+            pool.writer.inherited.update(pages)
+            pool.writer.notify({"type": "kv_quarantine", "pages": pages})
+
+    def _end_session(self, session: _Session, pool: _KvPool) -> None:
+        if session.fenced:
+            pool.fenced.remove(session)
+            pool.last_writer_live |= session.live
+        elif pool.writer is session:
+            pool.writer = None
+            pool.last_writer_live = session.live | session.inherited
+        else:
+            return
+        if not pool.fenced:
+            pool.last_writer_eof = time.monotonic()
+            if session.fenced and pool.writer is not None:
+                pool.writer.notify({"type": "kv_old_writer_gone"})
+        if not pool.complete:
+            # Died while depositing: the layout is unusable.
+            self._close_pool(pool)
+            if self._pool is pool:
+                self._pool = None
+        self._cond.notify_all()
 
     @staticmethod
     def _close_pool(pool: _KvPool) -> None:
@@ -381,14 +444,11 @@ class KvRestoreSession:
         self._forward_stream: Optional[torch.cuda.Stream] = None
         # Standby: every page, held so nothing writes into the writer's pool.
         self._held: Optional[torch.Tensor] = None
-        # The old writer's uncommitted pages, held until it is surely gone.
-        self._quarantine: Optional[torch.Tensor] = None
-        self._quarantine_deadline: Optional[float] = None
-        self._release_requested = False
         self._promoted_pages: Optional[int] = None
-        # The daemon's "promoted" reply once this rank holds the lease; a
-        # retried promotion (another rank timed out) must not ask again.
-        self._promote_reply: Optional[Dict[str, Any]] = None
+        # Quarantine of pages a predecessor writer may still write: from
+        # adoption until release, with daemon notes collected by a reader
+        # thread and applied identically on every TP rank by sync().
+        self._quarantine = _Quarantine()
 
     @property
     def mode(self) -> Optional[str]:
@@ -547,26 +607,23 @@ class KvRestoreSession:
         )
 
     def promote(self, timeout_s: float, grace_s: float) -> Tuple[int, int]:
-        """Become the writer: adopt the directory, quarantine the old writer's
-        uncommitted pages. Returns (adopted pages, quarantined pages).
+        """Become the writer at once: the daemon fences the old writer (which
+        may be frozen, not dead), this engine adopts the committed directory and
+        quarantines the old writer's uncommitted pages. Returns (adopted pages,
+        quarantined pages). ``timeout_s`` bounds the daemon exchange only.
         Idempotent; collective over the TP group."""
         if self._mode != "standby":
             if self._promoted_pages is None:
                 raise RuntimeError(f"[KvRestore] not a standby (mode {self._mode})")
-            return self._promoted_pages, self._quarantined_count()
-        if self._promote_reply is None:
-            self._conn.settimeout(timeout_s + 60)
-            self._send({"type": "kv_promote", "timeout_s": timeout_s})
+            return self._promoted_pages, self._quarantine.page_count()
+        self._conn.settimeout(timeout_s)
+        try:
+            self._send({"type": "kv_promote"})
             reply = recv_msg(self._conn)
-            if reply["status"] == "promoted":
-                self._promote_reply = reply
-        reply = self._promote_reply
-        if not _all_ranks(reply is not None):
-            # A rank that did get the lease keeps it; the orchestrator must
-            # retry promotion, which every rank answers idempotently.
-            raise RuntimeError(
-                "[KvRestore] promotion timed out waiting for the old writer to go"
-            )
+        except OSError as e:
+            reply = {"status": f"error: {e}"}
+        if not _all_ranks(reply["status"] == "promoted"):
+            raise RuntimeError(f"[KvRestore] promotion failed: {reply['status']}")
         self._conn.settimeout(None)
         allocator = self._tree_cache.token_to_kv_pool_allocator
         allocator.free(self._held)
@@ -574,73 +631,216 @@ class KvRestoreSession:
         self._mode = "restore"
         self._promoted_pages = self._adopt(reply, grace_s=grace_s)
         self._start_streaming()
-        return self._promoted_pages, self._quarantined_count()
+        return self._promoted_pages, self._quarantine.page_count()
 
     def _adopt(self, handover: Dict[str, Any], *, grace_s: float) -> int:
-        """Import the agreed directory and quarantine the old writer's live
-        pages; returns the number of adopted pages."""
+        """Import the agreed directory and start the quarantine of the
+        predecessors' uncommitted pages; returns the number of adopted pages."""
         entries = [tuple(e) for e in handover["directory"]]
         entries, live = _agree_across_tp(entries, handover["live"])
         adopted_tokens = import_directory(self._tree_cache, entries, self._page_size)
-        allocator = self._tree_cache.token_to_kv_pool_allocator
-        # Pages the import did not claim; the radix cache owns the claimed ones.
-        num_pages = allocator.size // self._page_size
-        candidates = [p for p in live if 0 < p <= num_pages]
-        quarantine = None
-        if candidates:
-            free = set(allocator.get_all_free_pages().tolist())
-            pages = [p for p in candidates if p in free]
-            if pages:
-                quarantine = allocator.alloc_pages(
-                    torch.tensor(pages, dtype=torch.int64)
-                )
         gone = handover["writer_gone_s"]
-        # Each rank's daemon saw its writer's EOF at a different time.
-        wait = _max_across_tp(max(0.0, grace_s - (gone if gone is not None else 0.0)))
-        if quarantine is not None and quarantine.numel():
-            self._quarantine = quarantine
-            self._quarantine_deadline = time.monotonic() + wait
-            self._release_requested = False
-            logger.info(
-                f"[KvRestore] quarantined {self._quarantined_count()} pages of the "
-                f"old writer for {wait:.1f}s"
-            )
+        q = self._quarantine
+        q.active = True
+        q.grace_s = grace_s
+        # Seconds of grace still to run once every rank's predecessor is gone.
+        q.remaining_s = _max_across_tp(
+            grace_s if gone is None else max(0.0, grace_s - gone)
+        )
+        q.old_gone = not handover["old_writer_alive"]
+        if not q.old_gone:
+            threading.Thread(
+                target=self._read_notes, name="kv-restore-notes", daemon=True
+            ).start()
+        self._withdraw(set(live))
+        self._sync_state(all_gone=_all_ranks(q.old_gone))
+        logger.info(
+            f"[KvRestore] adopted {adopted_tokens // self._page_size} pages; "
+            f"quarantined {q.page_count()}; predecessor "
+            f"{'gone' if q.old_gone else 'still connected (fenced)'}"
+        )
         return adopted_tokens // self._page_size
+
+    def _read_notes(self) -> None:
+        """Collect the daemon's notes about fenced predecessors."""
+        q = self._quarantine
+        try:
+            while True:
+                msg = recv_msg(self._conn)
+                with q.lock:
+                    if msg["type"] == "kv_quarantine":
+                        q.pending.update(msg["pages"])
+                    elif msg["type"] == "kv_old_writer_gone":
+                        q.pending_gone = True
+                        return
+        except (OSError, ConnectionError) as e:
+            logger.warning(f"[KvRestore] daemon notes stopped: {e}")
+
+    def _withdraw(self, pages: Set[int]) -> None:
+        """Keep ``pages`` out of reuse: claim free ones, evict cached ones from
+        the radix tree, and withhold those a running request holds until it
+        frees them."""
+        q = self._quarantine
+        num_pages = self._tree_cache.token_to_kv_pool_allocator.size // self._page_size
+        pages = {p for p in pages if 0 < p <= num_pages} - q.pages
+        if not pages:
+            return
+        allocator = self._tree_cache.token_to_kv_pool_allocator
+        free = set(allocator.get_all_free_pages().tolist())
+        in_use = pages - free
+        held = set()
+        if in_use:
+            held = self._tree_cache.evict_pages(in_use)
+            free = set(allocator.get_all_free_pages().tolist())
+        claim = sorted(p for p in pages if p in free)
+        if claim:
+            self._quarantine_claim(torch.tensor(claim, dtype=torch.int64))
+        held |= pages - set(claim) - in_use  # neither free nor in the tree
+        held |= in_use - free
+        if held:
+            q.withheld |= held
+            allocator.withheld_pages = torch.tensor(
+                sorted(q.withheld), dtype=torch.int64, device=allocator.device
+            )
+            logger.warning(
+                f"[KvRestore] {len(held)} pages a predecessor may still write are "
+                f"held by running requests; they stay out of reuse once freed"
+            )
+
+    def _quarantine_claim(self, page_ids: torch.Tensor) -> None:
+        allocator = self._tree_cache.token_to_kv_pool_allocator
+        listener, allocator.page_listener = allocator.page_listener, None
+        try:
+            indices = allocator.alloc_pages(page_ids)
+        finally:
+            allocator.page_listener = listener
+        if indices is None:
+            raise RuntimeError(f"[KvRestore] cannot quarantine pages {page_ids}")
+        self._quarantine.add(page_ids.tolist(), indices)
+
+    def _sync_state(self, *, all_gone: bool) -> None:
+        q = self._quarantine
+        if all_gone and q.deadline is None:
+            q.deadline = time.monotonic() + q.remaining_s
+
+    def sync(self) -> None:
+        """Apply the daemon's notes on every TP rank in the same step and
+        release the quarantine when rank 0's grace has passed."""
+        q = self._quarantine
+        if not q.active:
+            return
+        allocator = self._tree_cache.token_to_kv_pool_allocator
+        with q.lock:
+            pending, q.pending = q.pending, set()
+            if q.pending_gone:
+                q.old_gone = True
+        freed = set()
+        for ids in allocator.withheld_freed:
+            freed.update(ids.tolist())
+        allocator.withheld_freed = []
+        due = q.deadline is not None and time.monotonic() >= q.deadline
+        mine = (sorted(pending), q.old_gone, due, sorted(freed))
+        gathered = _gather_tp(mine)
+        union = set().union(*(set(g[0]) for g in gathered))
+        if union:
+            self._withdraw(union)
+        # Withheld pages freed by their requests are already off the free list.
+        withheld_freed = set().union(*(set(g[3]) for g in gathered)) & q.withheld
+        if withheld_freed:
+            q.withheld -= withheld_freed
+            self._refresh_withheld()
+            pages = torch.tensor(sorted(withheld_freed), dtype=torch.int64)
+            offsets = torch.arange(self._page_size, dtype=torch.int64)
+            q.add(
+                pages.tolist(),
+                (pages[:, None] * self._page_size + offsets)
+                .reshape(-1)
+                .to(allocator.device),
+            )
+        self._sync_state(all_gone=all(g[1] for g in gathered))
+        if gathered[0][2]:
+            self.release_quarantine()
+
+    def _refresh_withheld(self) -> None:
+        allocator = self._tree_cache.token_to_kv_pool_allocator
+        allocator.withheld_pages = (
+            torch.tensor(
+                sorted(self._quarantine.withheld),
+                dtype=torch.int64,
+                device=allocator.device,
+            )
+            if self._quarantine.withheld
+            else None
+        )
 
     @property
     def held_tokens(self) -> int:
         held = 0 if self._held is None else self._held.numel()
-        quarantined = 0 if self._quarantine is None else self._quarantine.numel()
-        return held + quarantined
-
-    def _quarantined_count(self) -> int:
-        if self._quarantine is None:
-            return 0
-        return self._quarantine.numel() // self._page_size
+        freed = 0
+        if self._tree_cache is not None:
+            allocator = self._tree_cache.token_to_kv_pool_allocator
+            freed = sum(ids.numel() for ids in allocator.withheld_freed)
+            freed *= self._page_size
+        return held + self._quarantine.page_count() * self._page_size + freed
 
     def release_quarantine(self) -> int:
-        """Return the quarantined pages to the allocator; returns how many."""
-        if self._quarantine is None:
+        """End the quarantine: return its pages to the allocator and stop
+        withholding; returns the number of pages released. Later notes about
+        fenced predecessors are ignored."""
+        q = self._quarantine
+        if not q.active:
             return 0
-        count = self._quarantined_count()
-        self._tree_cache.token_to_kv_pool_allocator.free(self._quarantine)
-        self._quarantine = None
-        self._quarantine_deadline = None
+        count = q.page_count()
+        allocator = self._tree_cache.token_to_kv_pool_allocator
+        for indices in q.indices:
+            allocator.free(indices)
+        q.reset()
+        allocator.withheld_pages = None
+        for ids in allocator.withheld_freed:
+            allocator.free_page_ids(ids)
+        allocator.withheld_freed = []
         logger.info(f"[KvRestore] released {count} quarantined pages")
         return count
 
-    def due_release(self) -> bool:
-        """Whether the grace has passed and no release was requested yet.
-        Checked on the rank that pulls requests, so every rank releases in
-        the same scheduler step."""
-        if (
-            self._quarantine_deadline is None
-            or self._release_requested
-            or time.monotonic() < self._quarantine_deadline
-        ):
+    def needs_sync(self, now: float) -> bool:
+        """Checked on the rank that pulls requests: a sync is due every
+        SYNC_INTERVAL_S while the quarantine is active."""
+        q = self._quarantine
+        if not q.active or now - q.last_sync < _SYNC_INTERVAL_S:
             return False
-        self._release_requested = True
+        q.last_sync = now
         return True
+
+
+class _Quarantine:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        self.active = False
+        self.pages: Set[int] = set()
+        self.indices: List[torch.Tensor] = []
+        self.withheld: Set[int] = set()
+        self.pending: Set[int] = set()
+        self.pending_gone = False
+        self.old_gone = True
+        self.grace_s = 0.0
+        self.remaining_s = 0.0
+        self.deadline: Optional[float] = None
+        self.last_sync = 0.0
+
+    def add(self, pages: List[int], indices: torch.Tensor) -> None:
+        self.pages.update(pages)
+        self.indices.append(indices)
+
+    def page_count(self) -> int:
+        return len(self.pages)
+
+
+# How often the request-pulling rank schedules a quarantine sync; arbitrary,
+# bounds how long a predecessor's late eviction stays reusable.
+_SYNC_INTERVAL_S = 0.1
 
 
 # A restarted writer cannot tell how long its predecessor's GPU work may
@@ -653,6 +853,15 @@ def _tp_group():
 
     parallel = get_parallel()
     return parallel.tp_group if parallel.tp_size > 1 else None
+
+
+def _gather_tp(obj):
+    group = _tp_group()
+    if group is None:
+        return [obj]
+    out = [None] * group.world_size
+    torch.distributed.all_gather_object(out, obj, group=group.cpu_group)
+    return out
 
 
 def _all_ranks(flag: bool) -> bool:
@@ -951,21 +1160,24 @@ def handle_promote(req):
 
 
 def handle_release_quarantine(req):
-    """Release the quarantine; runs on every TP rank in the same step.
-    Internal requests (the grace ended) get no reply."""
+    """Release the quarantine early; runs on every TP rank in the same step."""
     from sglang.srt.managers.io_struct import KvRestoreReleaseQuarantineReqOutput
 
     released = 0 if _session is None else _session.release_quarantine()
-    if req.internal:
-        return None
     return KvRestoreReleaseQuarantineReqOutput(released_pages=released)
 
 
-def due_internal_requests() -> List[Any]:
-    """Requests the request-pulling rank adds to the broadcast: a quarantine
-    release once its grace has passed."""
-    if _session is None or not _session.due_release():
-        return []
-    from sglang.srt.managers.io_struct import KvRestoreReleaseQuarantineReqInput
+def handle_sync(req) -> None:
+    """Apply predecessor notes and maybe release; internal, no reply."""
+    if _session is not None:
+        _session.sync()
 
-    return [KvRestoreReleaseQuarantineReqInput(internal=True)]
+
+def due_internal_requests() -> List[Any]:
+    """Requests the request-pulling rank adds to the broadcast so every rank
+    handles them in the same step: a quarantine sync while one is active."""
+    if _session is None or not _session.needs_sync(time.monotonic()):
+        return []
+    from sglang.srt.managers.io_struct import KvRestoreSyncReqInput
+
+    return [KvRestoreSyncReqInput()]

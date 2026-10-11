@@ -2161,10 +2161,11 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
 class KvRestorePromoteReqInput(BaseReq, kw_only=True):
     """Promote a weight cache KV restore standby to the pool's writer."""
 
-    # How long to wait for the old writer's daemon session to end.
+    # Bounds the exchange with the daemon; promotion never waits for the old
+    # writer, it fences it.
     timeout_s: float
-    # The old writer's uncommitted pages stay unallocatable this long after
-    # its session ended, in case its GPU work is still running.
+    # Pages the fenced old writer may still write stay unallocatable until
+    # this long after its daemon session ended.
     quarantine_grace_s: float = 2.0
 
 
@@ -2176,8 +2177,12 @@ class KvRestorePromoteReqOutput(BaseReq, kw_only=True):
 
 
 class KvRestoreReleaseQuarantineReqInput(BaseReq, kw_only=True):
-    # True when the scheduler sends it to itself at the end of the grace.
-    internal: bool = False
+    pass
+
+
+class KvRestoreSyncReqInput(BaseReq, kw_only=True):
+    """Internal: TP ranks apply the daemon's notes on fenced predecessors and
+    release an expired quarantine in the same step."""
 
 
 class KvRestoreReleaseQuarantineReqOutput(BaseReq, kw_only=True):

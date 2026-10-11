@@ -379,6 +379,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        page_ids = tuple(self._divert_withheld(ids) for ids in page_ids)
         for ids in page_ids:
             self._notify_released(ids)
         if self.need_sort:

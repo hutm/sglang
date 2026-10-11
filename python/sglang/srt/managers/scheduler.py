@@ -155,6 +155,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     KvRestorePromoteReqInput,
     KvRestoreReleaseQuarantineReqInput,
+    KvRestoreSyncReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -1823,6 +1824,7 @@ class Scheduler(
                     KvRestoreReleaseQuarantineReqInput,
                     kv_restore.handle_release_quarantine,
                 ),
+                (KvRestoreSyncReqInput, kv_restore.handle_sync),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (

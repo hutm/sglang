@@ -63,6 +63,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # Told which pages are allocated and released (weight cache KV
         # restore); on_pages_allocated runs before the KV is written.
         self.page_listener = None
+        # Pages kept out of the free list when released (weight cache KV
+        # restore quarantine): they collect in withheld_freed instead.
+        self.withheld_pages: Optional[torch.Tensor] = None
+        self.withheld_freed: list[torch.Tensor] = []
 
     @property
     def size_full(self):
@@ -245,6 +249,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def _notify_released(self, page_ids: torch.Tensor) -> None:
         if self.page_listener is not None and page_ids.numel():
             self.page_listener.on_pages_released(page_ids)
+
+    def _divert_withheld(self, page_ids: torch.Tensor) -> torch.Tensor:
+        """Drop withheld pages from a release, keeping them in withheld_freed."""
+        if self.withheld_pages is None or page_ids.numel() == 0:
+            return page_ids
+        withheld = torch.isin(page_ids, self.withheld_pages)
+        if bool(withheld.any()):
+            self.withheld_freed.append(page_ids[withheld])
+            page_ids = page_ids[~withheld]
+        return page_ids
 
     def _notify_cleared(self) -> None:
         if self.page_listener is not None:

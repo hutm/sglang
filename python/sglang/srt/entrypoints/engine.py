@@ -1825,10 +1825,12 @@ class Engine(EngineScoreMixin, EngineBase):
         """Promote a weight cache KV restore standby
         (SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE=standby) to the pool's writer.
 
-        Waits up to timeout_s for the old writer's daemon session to end, adopts
-        its committed radix cache, and quarantines its uncommitted pages until
-        quarantine_grace_s after that session ended. Returns the number of
-        adopted cached pages. Idempotent.
+        Does not wait for the old writer: the daemon revokes its lease (it may
+        be frozen rather than dead) and this engine adopts the committed radix
+        cache. Pages the old writer may still write are quarantined until
+        quarantine_grace_s after its daemon session ended, or until
+        kv_restore_release_quarantine(). timeout_s bounds the daemon exchange.
+        Returns the number of adopted cached pages. Idempotent.
         """
         return self.loop.run_until_complete(
             self.tokenizer_manager.kv_restore_promote(timeout_s, quarantine_grace_s)

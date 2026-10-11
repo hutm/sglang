@@ -683,6 +683,55 @@ class UnifiedRadixCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
+    def evict_pages(self, page_ids: set[int]) -> set[int]:
+        """Evict the device nodes holding any of ``page_ids``, with their
+        subtrees, e.g. pages another process may still write (weight cache KV
+        restore). Returns the pages left in the tree because a request locks
+        their subtree, or all of them when the tree core is not walkable."""
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+            UnifiedTreeCore,
+        )
+
+        if not isinstance(self.tree_core, UnifiedTreeCore):
+            return set(page_ids)
+        full = BASE_COMPONENT_TYPE
+        targets = []
+        stack = list(self.tree_core.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            value = node.component_data[full].value
+            if (
+                value is not None
+                and len(value)
+                and not page_ids.isdisjoint(
+                    (value[:: self.page_size] // self.page_size).tolist()
+                )
+            ):
+                targets.append(node)  # its subtree goes with it
+                continue
+            stack.extend(node.children.values())
+        held: set[int] = set()
+        tracker = {ct: 0 for ct in self.tree_components}
+        for target in targets:
+            subtree, stack = [], [target]
+            while stack:
+                node = stack.pop()
+                subtree.append(node)
+                stack.extend(node.children.values())
+            if any(cd.lock_ref > 0 for n in subtree for cd in n.component_data):
+                for n in subtree:
+                    value = n.component_data[full].value
+                    if value is not None:
+                        held.update(
+                            (value[:: self.page_size] // self.page_size).tolist()
+                        )
+                continue
+            # Children before parents, so each node is a device leaf when evicted.
+            for node in reversed(subtree):
+                if node.component_data[full].value is not None:
+                    self._evict_device_leaf(node.id, tracker)
+        return held & page_ids
+
     @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, params: EvictParams) -> EvictResult:
         """Evict until the requested component allocations become feasible.

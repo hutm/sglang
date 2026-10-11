@@ -136,14 +136,22 @@ class TestWeightCacheKvRestore(CustomTestCase):
             f"restored={restored[0][1]} restore_off={cold[0][1]}"
         )
 
-    def test_standby_promotes_and_serves_from_the_writers_cache(self):
+    def test_standby_promotes_while_the_writer_is_frozen(self):
         # A standby on the same GPU maps the writer's weights and KV pool
-        # without copies, takes over after the writer is SIGKILLed, and answers
-        # from the writer's radix cache.
+        # without copies. The writer is frozen (SIGSTOP), as a rank stuck in a
+        # collective would be: its daemon session never ends. Promotion must
+        # not wait for it, the standby answers from the writer's radix cache,
+        # and the quarantine ends once the frozen writer finally dies.
+        import signal
+
+        import psutil
+
         import sglang as sgl
         from sglang.srt.utils import kill_process_tree
 
         writer = self._launch(restore=True)
+        writer_procs = [psutil.Process(writer.pid)]
+        writer_procs += writer_procs[0].children(recursive=True)
         try:
             first = [self._generate(p) for p in PROMPTS]
             time.sleep(1)  # let the last commits reach the daemon
@@ -160,6 +168,7 @@ class TestWeightCacheKvRestore(CustomTestCase):
                     model_path=MODEL,
                     weight_cache_mode="client",
                     mem_fraction_static=0.3,
+                    log_level="info",
                 )
             finally:
                 for k, v in saved.items():
@@ -168,23 +177,26 @@ class TestWeightCacheKvRestore(CustomTestCase):
                     else:
                         os.environ[k] = v
             standby_bytes = free_before - torch.cuda.mem_get_info()[0]
-        finally:
-            kill_process_tree(writer.pid)  # SIGKILL; the daemon stays up
 
-        try:
-            started = time.time()
-            adopted = standby.kv_restore_promote(60, quarantine_grace_s=0.5)
-            promote_s = time.time() - started
-            params = {"temperature": 0, "max_new_tokens": 16}
-            served = [standby.generate(p, params) for p in PROMPTS]
-            # Quarantined pages return after the grace on the next steps.
-            time.sleep(1.0)
-            standby.generate("warm", {"max_new_tokens": 1})
-            released_early = standby.kv_restore_release_quarantine()
+            for proc in writer_procs:
+                proc.send_signal(signal.SIGSTOP)
+            try:
+                started = time.time()
+                adopted = standby.kv_restore_promote(10, quarantine_grace_s=0.5)
+                promote_s = time.time() - started
+                params = {"temperature": 0, "max_new_tokens": 16}
+                served = [standby.generate(p, params) for p in PROMPTS]
+            finally:
+                kill_process_tree(writer.pid)  # SIGKILL ends its session
+            time.sleep(2.0)  # EOF reaches the standby, then the grace runs
+            released_late = standby.kv_restore_release_quarantine()
         finally:
-            standby.shutdown()
+            if writer.poll() is None:
+                kill_process_tree(writer.pid)
+        standby.shutdown()
 
         self.assertGreater(adopted, 0)
+        self.assertLess(promote_s, 5.0)
         self.assertGreater(served[0]["meta_info"]["cached_tokens"], len(PREFIX) // 8)
         for (text, _), out in zip(first, served):
             self.assertEqual(text, out["text"])
@@ -192,11 +204,15 @@ class TestWeightCacheKvRestore(CustomTestCase):
         # 0.3 x GPU static budget (context, activations and graphs only).
         total = torch.cuda.mem_get_info()[1]
         self.assertLess(standby_bytes, 0.1 * total)
-        self.assertEqual(released_early, 0)  # the grace already released them
+        self.assertEqual(released_late, 0)  # released by itself after the grace
+        self.daemon_log.seek(0)
+        daemon_log = self.daemon_log.read()
+        # The writer was still connected (fenced), not dead, at promotion.
+        self.assertIn("1 fenced writers still connected", daemon_log)
         print(
-            f"standby added {standby_bytes / 2**30:.2f} GiB; promote "
-            f"{promote_s:.3f}s adopted {adopted} pages; first cached tokens "
-            f"{served[0]['meta_info']['cached_tokens']}"
+            f"standby added {standby_bytes / 2**30:.2f} GiB; promote with a "
+            f"frozen writer {promote_s:.3f}s adopted {adopted} pages; first "
+            f"cached tokens {served[0]['meta_info']['cached_tokens']}"
         )
 
 

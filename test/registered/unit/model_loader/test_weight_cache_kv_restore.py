@@ -4,6 +4,7 @@ commit/evict ordering (CPU)."""
 import os
 import socket
 import threading
+import time
 from array import array
 from types import SimpleNamespace
 
@@ -196,16 +197,22 @@ def _attach(store, role, **extra):
     return engine, thread
 
 
-def test_standby_maps_the_writers_pool_and_promotes_after_writer_eof():
-    # A standby attaching first waits for the writer's deposit, then gets the
-    # same buffers; it can only promote once the writer's session is gone,
-    # and it inherits the directory plus the writer's uncommitted live pages.
-    store = kv_restore.KvRestoreStore()
-    standby, standby_thread = _attach(store, "standby", wait_s=10)
+def _writer_with_pool(store):
     writer, writer_thread = _attach(store, "writer")
     assert recv_msg(writer) == {"status": "fresh"}
     _deposit(writer, b"kv0")
     send_msg(writer, {"type": "kv_layout_done", "count": 1, "token_capacity": 16})
+    return writer, writer_thread
+
+
+def test_promotion_fences_a_live_writer_and_forwards_its_late_writes():
+    # The old writer may be frozen in a collective, never closing its session.
+    # Promotion must not wait for it: the standby becomes the writer at once,
+    # the fenced writer's late evictions and allocations are forwarded for
+    # quarantine, its late commits are ignored, and its EOF is announced.
+    store = kv_restore.KvRestoreStore()
+    standby, standby_thread = _attach(store, "standby", wait_s=10)
+    writer, writer_thread = _writer_with_pool(store)
     reply = recv_msg(standby)
     assert reply == {"status": "standby", "buffers": [DESC], "token_capacity": 16}
     _, fd = _recv_fd(standby)
@@ -216,22 +223,40 @@ def test_standby_maps_the_writers_pool_and_promotes_after_writer_eof():
     send_msg(writer, {"type": "kv_live", "add": [2, 3, 9], "remove": []})
     send_msg(writer, {"type": "kv_live", "add": [4], "remove": [3]})
     send_msg(writer, {"type": "kv_commit", "pages": [page]})
-    send_msg(standby, {"type": "kv_promote", "timeout_s": 0.2})
-    assert recv_msg(standby) == {"status": "timeout"}  # writer still alive
+    time.sleep(0.2)  # let the daemon apply them before the promotion
 
-    _end(writer, writer_thread)
-    send_msg(standby, {"type": "kv_promote", "timeout_s": 10})
+    send_msg(standby, {"type": "kv_promote"})
     promoted = recv_msg(standby)
     assert promoted["status"] == "promoted"
     assert promoted["directory"] == [page]
     assert promoted["live"] == [4, 9]  # live minus committed
-    assert promoted["writer_gone_s"] >= 0
+    assert promoted["old_writer_alive"] is True
+    assert promoted["writer_gone_s"] is None
+
+    late = (7, 2, (5, 6, 7, 8), None, None)
+    send_msg(writer, {"type": "kv_commit", "pages": [late]})  # ignored
+    send_msg(writer, {"type": "kv_evict", "page_ids": [2]})
+    assert recv_msg(standby) == {"type": "kv_quarantine", "pages": [2]}
+    send_msg(writer, {"type": "kv_live", "add": [11], "remove": []})
+    assert recv_msg(standby) == {"type": "kv_quarantine", "pages": [11]}
+    assert store._pool.directory == {}
+    _end(writer, writer_thread)
+    assert recv_msg(standby) == {"type": "kv_old_writer_gone"}
 
     # The promoted standby holds the lease now.
     other, other_thread = _attach(store, "writer")
     assert recv_msg(other) == {"status": "busy"}
     _end(other, other_thread)
     _end(standby, standby_thread)
+
+    # A writer restoring after both left inherits everything still live.
+    writer, writer_thread = _attach(store, "writer")
+    restored = recv_msg(writer)
+    assert restored["status"] == "restore"
+    assert restored["old_writer_alive"] is False
+    assert set(restored["live"]) >= {4, 9, 11}
+    assert restored["writer_gone_s"] >= 0
+    _end(writer, writer_thread)
     store.close()
 
 
@@ -262,10 +287,30 @@ def _standby_session(cache):
     return session
 
 
-def test_promotion_quarantines_old_writer_pages_until_the_grace_ends(monkeypatch):
-    # The old writer's uncommitted pages may still be written by its GPU work:
-    # after promotion they must not be allocatable until the grace ends, and
-    # the release is requested once.
+def _wait_pending(session, pages=(), gone=False):
+    q = session._quarantine
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        with q.lock:
+            if set(pages) <= q.pending and (not gone or q.pending_gone):
+                return
+        time.sleep(0.01)
+    raise AssertionError("daemon note not received")
+
+
+def _match_len(cache, *pages):
+    match = cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", _tokens(*pages))))
+    )
+    return match.device_prefix_len
+
+
+def test_promotion_quarantines_a_fenced_writers_pages_until_it_is_gone(monkeypatch):
+    # Pages the fenced old writer may still write are kept out of reuse: its
+    # uncommitted pages at promotion, and pages it evicts or allocates later,
+    # including pages already adopted into the radix cache, which are
+    # withdrawn with their node. All return only after its session ended plus
+    # the grace.
     now = [100.0]
     monkeypatch.setattr(kv_restore.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(kv_restore, "_tp_group", lambda: None)
@@ -276,31 +321,90 @@ def test_promotion_quarantines_old_writer_pages_until_the_grace_ends(monkeypatch
 
     engine, daemon = socket.socketpair()
     session._conn = engine
-    entries = [(3, -1, tuple(_tokens(3)), None, None)]
+    entries = [
+        (3, -1, tuple(_tokens(3)), None, None),
+        (4, 3, tuple(_tokens(4)), None, None),
+    ]
     send_msg(
         daemon,
         {
             "status": "promoted",
             "directory": entries,
             "live": [5, 9],
-            "writer_gone_s": 0.5,
+            "old_writer_alive": True,
+            "writer_gone_s": None,
         },
     )
-    adopted, quarantined = session.promote(timeout_s=5, grace_s=2.0)
-    assert (adopted, quarantined) == (1, 2)
-    assert recv_msg(daemon) == {"type": "kv_promote", "timeout_s": 5}
-    assert allocator.available_size() == (16 - 3) * PAGE
-    assert allocator.alloc_pages(torch.tensor([5])) is None  # quarantined
-    assert session.promote(timeout_s=5, grace_s=2.0) == (1, 2)  # idempotent
+    assert session.promote(timeout_s=5, grace_s=2.0) == (2, 2)
+    assert recv_msg(daemon) == {"type": "kv_promote"}
+    assert allocator.available_size() == (16 - 4) * PAGE
+    assert _match_len(cache, 3, 4) == 2 * PAGE
+    assert session.promote(timeout_s=5, grace_s=2.0) == (2, 2)  # idempotent
 
-    now[0] += 1.0
-    assert kv_restore._session is None
-    assert not session.due_release()
-    now[0] += 0.6  # 2.0 grace - 0.5 already gone
-    assert session.due_release()
-    assert not session.due_release()  # requested once
-    assert session.release_quarantine() == 2
-    assert allocator.available_size() == (16 - 1) * PAGE
+    # The fenced writer evicts adopted page 4 and allocates free page 7.
+    send_msg(daemon, {"type": "kv_quarantine", "pages": [4]})
+    send_msg(daemon, {"type": "kv_quarantine", "pages": [7]})
+    _wait_pending(session, pages=[4, 7])
+    assert session.needs_sync(now[0])
+    assert not session.needs_sync(now[0])  # one per interval
+    session.sync()
+    assert session._quarantine.pages == {5, 7, 9, 4}
+    # Page 4 shares a radix node with page 3; the whole node is withdrawn,
+    # page 3 back to the free list.
+    assert _match_len(cache, 3, 4) == 0
+    assert allocator.alloc_pages(torch.tensor([4])) is None
+
+    send_msg(daemon, {"type": "kv_old_writer_gone"})
+    _wait_pending(session, gone=True)
+    session.sync()  # starts the grace
+    now[0] += 1.9
+    session.sync()
+    assert session._quarantine.page_count() == 4
+    now[0] += 0.2
+    session.sync()
+    assert session._quarantine.page_count() == 0
+    assert allocator.available_size() == 16 * PAGE
+    engine.close()
+    daemon.close()
+
+
+def test_pages_held_by_a_request_are_quarantined_when_freed(monkeypatch):
+    # A running request may hold a page the fenced writer evicted: it cannot
+    # be withdrawn from the tree, so it must not return to the free list when
+    # the request frees it.
+    monkeypatch.setattr(kv_restore, "_tp_group", lambda: None)
+    allocator = _paged()
+    cache = _cache(allocator)
+    session = _standby_session(cache)
+    engine, daemon = socket.socketpair()
+    session._conn = engine
+    entries = [(3, -1, tuple(_tokens(3)), None, None)]
+    send_msg(
+        daemon,
+        {
+            "status": "promoted",
+            "directory": entries,
+            "live": [],
+            "old_writer_alive": True,
+            "writer_gone_s": None,
+        },
+    )
+    session.promote(timeout_s=5, grace_s=2.0)
+    match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", _tokens(3)))))
+    cache.inc_lock_ref(match.last_device_node)
+    send_msg(daemon, {"type": "kv_quarantine", "pages": [3]})
+    _wait_pending(session, pages=[3])
+    session.sync()
+    assert session._quarantine.withheld == {3}
+    assert _match_len(cache, 3) == PAGE  # still cached for its user
+
+    allocator.free(torch.arange(3 * PAGE, 4 * PAGE))  # the request lets go
+    assert allocator.alloc_pages(torch.tensor([3])) is None  # not reusable
+    session.sync()
+    assert session._quarantine.pages == {3}
+    assert session._quarantine.withheld == set()
+    assert session.release_quarantine() == 1
+    assert allocator.alloc_pages(torch.tensor([3])) is not None
     engine.close()
     daemon.close()
 
