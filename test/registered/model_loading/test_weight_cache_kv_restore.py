@@ -136,6 +136,69 @@ class TestWeightCacheKvRestore(CustomTestCase):
             f"restored={restored[0][1]} restore_off={cold[0][1]}"
         )
 
+    def test_standby_promotes_and_serves_from_the_writers_cache(self):
+        # A standby on the same GPU maps the writer's weights and KV pool
+        # without copies, takes over after the writer is SIGKILLed, and answers
+        # from the writer's radix cache.
+        import sglang as sgl
+        from sglang.srt.utils import kill_process_tree
+
+        writer = self._launch(restore=True)
+        try:
+            first = [self._generate(p) for p in PROMPTS]
+            time.sleep(1)  # let the last commits reach the daemon
+
+            env = {
+                "SGLANG_WEIGHT_CACHE_KV_RESTORE": "1",
+                "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE": "standby",
+            }
+            saved = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            free_before = torch.cuda.mem_get_info()[0]
+            try:
+                standby = sgl.Engine(
+                    model_path=MODEL,
+                    weight_cache_mode="client",
+                    mem_fraction_static=0.3,
+                )
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k)
+                    else:
+                        os.environ[k] = v
+            standby_bytes = free_before - torch.cuda.mem_get_info()[0]
+        finally:
+            kill_process_tree(writer.pid)  # SIGKILL; the daemon stays up
+
+        try:
+            started = time.time()
+            adopted = standby.kv_restore_promote(60, quarantine_grace_s=0.5)
+            promote_s = time.time() - started
+            params = {"temperature": 0, "max_new_tokens": 16}
+            served = [standby.generate(p, params) for p in PROMPTS]
+            # Quarantined pages return after the grace on the next steps.
+            time.sleep(1.0)
+            standby.generate("warm", {"max_new_tokens": 1})
+            released_early = standby.kv_restore_release_quarantine()
+        finally:
+            standby.shutdown()
+
+        self.assertGreater(adopted, 0)
+        self.assertGreater(served[0]["meta_info"]["cached_tokens"], len(PREFIX) // 8)
+        for (text, _), out in zip(first, served):
+            self.assertEqual(text, out["text"])
+        # No second weights or KV pool: the standby adds far less than its
+        # 0.3 x GPU static budget (context, activations and graphs only).
+        total = torch.cuda.mem_get_info()[1]
+        self.assertLess(standby_bytes, 0.1 * total)
+        self.assertEqual(released_early, 0)  # the grace already released them
+        print(
+            f"standby added {standby_bytes / 2**30:.2f} GiB; promote "
+            f"{promote_s:.3f}s adopted {adopted} pages; first cached tokens "
+            f"{served[0]['meta_info']['cached_tokens']}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

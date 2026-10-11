@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
 )
+from sglang.srt.weight_cache import kv_restore
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -94,6 +95,9 @@ class SchedulerRequestReceiver:
                 return []
 
         recv_reqs = self._pull_raw_reqs()
+        if recv_reqs is not None:
+            # Rides the broadcast so every rank acts in the same step.
+            recv_reqs.extend(kv_restore.due_internal_requests())
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)

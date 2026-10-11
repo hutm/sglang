@@ -45,6 +45,10 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KvRestorePromoteReqInput,
+    KvRestorePromoteReqOutput,
+    KvRestoreReleaseQuarantineReqInput,
+    KvRestoreReleaseQuarantineReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -121,6 +125,8 @@ _COMMUNICATOR_SPECS = [
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
+    ("kv_restore_promote", KvRestorePromoteReqOutput),
+    ("kv_restore_release_quarantine", KvRestoreReleaseQuarantineReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
@@ -882,6 +888,32 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def kv_restore_promote(
+        self: TokenizerManager, timeout_s: float, quarantine_grace_s: float = 2.0
+    ) -> int:
+        """Promote a weight cache KV restore standby to writer; returns the
+        number of adopted cached pages. The old writer's uncommitted pages stay
+        quarantined for quarantine_grace_s after its daemon session ended."""
+        self.auto_create_handle_loop()
+        results = await self.kv_restore_promote_communicator(
+            KvRestorePromoteReqInput(
+                timeout_s=timeout_s, quarantine_grace_s=quarantine_grace_s
+            )
+        )
+        failed = [r.message for r in results if not r.success]
+        if failed:
+            raise RuntimeError("; ".join(failed))
+        return sum(r.adopted_pages for r in results)
+
+    async def kv_restore_release_quarantine(self: TokenizerManager) -> int:
+        """Release quarantined pages early (the orchestrator proved the old
+        writer's GPU work is gone); returns the number released."""
+        self.auto_create_handle_loop()
+        results = await self.kv_restore_release_quarantine_communicator(
+            KvRestoreReleaseQuarantineReqInput()
+        )
+        return sum(r.released_pages for r in results)
 
     async def check_weights(
         self: TokenizerManager,

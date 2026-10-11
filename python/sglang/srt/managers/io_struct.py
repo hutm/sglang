@@ -2158,6 +2158,32 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class KvRestorePromoteReqInput(BaseReq, kw_only=True):
+    """Promote a weight cache KV restore standby to the pool's writer."""
+
+    # How long to wait for the old writer's daemon session to end.
+    timeout_s: float
+    # The old writer's uncommitted pages stay unallocatable this long after
+    # its session ended, in case its GPU work is still running.
+    quarantine_grace_s: float = 2.0
+
+
+class KvRestorePromoteReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    adopted_pages: int = 0
+    quarantined_pages: int = 0
+
+
+class KvRestoreReleaseQuarantineReqInput(BaseReq, kw_only=True):
+    # True when the scheduler sends it to itself at the end of the grace.
+    internal: bool = False
+
+
+class KvRestoreReleaseQuarantineReqOutput(BaseReq, kw_only=True):
+    released_pages: int
+
+
 class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     """Open a weight-update session: restore in-place-packed weights so new ones can load."""
 

@@ -1924,6 +1924,10 @@ class Envs:
     # the next engine with the same weights and KV layout maps the same KV
     # buffers and adopts the radix cache. Engine side only.
     SGLANG_WEIGHT_CACHE_KV_RESTORE = EnvBool(False)
+    # With KV restore: "writer" restores or deposits the pool and serves;
+    # "standby" maps the writer's pool without writing to it until an
+    # orchestrator calls kv_restore_promote (warm standby on the same GPU).
+    SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE = EnvStr("writer")
 
 
 envs = Envs()

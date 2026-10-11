@@ -38,6 +38,7 @@ from sglang.srt.utils.common import (
     raise_error_or_warn,
 )
 from sglang.srt.utils.watchdog import WatchdogRaw
+from sglang.srt.weight_cache import kv_restore
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -100,19 +101,28 @@ class SchedulerInvariantChecker:
             return False, ""
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
-            session_held = self.pool_stats_observer.session_held_tokens()
+            session_held = (
+                self.pool_stats_observer.session_held_tokens()
+                + kv_restore.held_tokens()
+            )
             total = ps.full_capacity
         elif self.is_hybrid_ssm:
             # `total` is the allocator's `.size`: static for non-unified pools,
             # the byte-coordinated cap (matching `available_size`) for the unified pool.
             protected = self.tree_cache.full_protected_size()
-            session_held = self.pool_stats_observer.session_held_tokens()
+            session_held = (
+                self.pool_stats_observer.session_held_tokens()
+                + kv_restore.held_tokens()
+            )
             total = self.req_to_token_pool.schedulable_token_capacity(
                 self.token_to_kv_pool_allocator.size
             )
         else:
             protected = self.tree_cache.protected_size()
-            session_held = self.pool_stats_observer.session_held_tokens()
+            session_held = (
+                self.pool_stats_observer.session_held_tokens()
+                + kv_restore.held_tokens()
+            )
             total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
         full_available = ps.full_available_size
