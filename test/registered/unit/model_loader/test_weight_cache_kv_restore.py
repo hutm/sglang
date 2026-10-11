@@ -441,3 +441,17 @@ def test_tp_ranks_agree_on_imported_entries_and_quarantine(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     for entries, live in ranks:
         assert kv_restore._agree_across_tp(entries, live) == ([a], [7, 8])
+
+
+def test_warm_up_leaves_the_allocator_and_tree_unchanged():
+    # The warm-up exercises adoption, withdrawal and the quarantine on scratch
+    # pages at startup; it must not leave pages taken, withheld or cached.
+    allocator = _paged()
+    cache = _cache(allocator)
+    session = kv_restore.KvRestoreSession("unused", KEY, page_size=PAGE)
+    session._tree_cache = cache
+    free_before = sorted(allocator.get_all_free_pages().tolist())
+    session._warm_up()
+    assert sorted(allocator.get_all_free_pages().tolist()) == free_before
+    assert allocator.withheld_pages is None and allocator.withheld_freed == []
+    assert cache.tree_core.root_node.children == {}

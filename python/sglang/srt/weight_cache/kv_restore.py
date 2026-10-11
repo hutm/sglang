@@ -560,12 +560,22 @@ class KvRestoreSession:
         streaming updates, a standby takes every page and waits."""
         if self._mode in (None, "off"):
             return
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+            UnifiedTreeCore,
+        )
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         if not isinstance(tree_cache, UnifiedRadixCache) or tree_cache.disable:
             raise RuntimeError(
                 "[KvRestore] needs the radix cache (UnifiedRadixCache) enabled; "
                 "unset SGLANG_WEIGHT_CACHE_KV_RESTORE"
+            )
+        if not isinstance(tree_cache.tree_core, UnifiedTreeCore):
+            # Other cores do not report per-node device stores/removes, so the
+            # directory would silently stay empty.
+            raise RuntimeError(
+                f"[KvRestore] needs the Python TreeCore, got "
+                f"{type(tree_cache.tree_core).__name__}"
             )
         if self._mode in ("restore", "standby") and len(self._buffers) != len(
             self._restore_descs
@@ -586,6 +596,7 @@ class KvRestoreSession:
                 }
             )
         self._conn.settimeout(None)
+        self._warm_up()
         if self._mode == "standby":
             self._held = allocator.alloc(allocator.available_size())
             return
@@ -594,6 +605,41 @@ class KvRestoreSession:
             logger.info(f"[KvRestore] adopted {pages} cached pages")
             self._handover = {}
         self._start_streaming()
+
+    def _warm_up(self) -> None:
+        """Run the allocator and radix operations that adoption, withdrawal
+        and the quarantine use once, on two scratch pages under a private
+        namespace, so their CUDA kernels are loaded before a promotion needs
+        them: the first use of each can take seconds (the driver JIT-compiles
+        PTX when the build lacks SASS for the GPU) and would land on the
+        failover path. Leaves the allocator and tree as they were."""
+        tree_cache = self._tree_cache
+        allocator = tree_cache.token_to_kv_pool_allocator
+        ps = self._page_size
+        if allocator.available_size() < 2 * ps:
+            return
+        free = allocator.get_all_free_pages()
+        first, second = int(free[0]), int(free[1])
+        entries = [
+            (first, NO_PARENT_PAGE, tuple(range(ps)), _WARM_UP_KEY, None),
+            (second, first, tuple(range(ps, 2 * ps)), _WARM_UP_KEY, None),
+        ]
+        events = tree_cache.tree_core.kv_events
+        events_enabled, events.enabled = events.enabled, False
+        try:
+            import_directory(tree_cache, entries, ps)
+            tree_cache.evict_pages({first, second})
+            indices = allocator.alloc_pages(torch.tensor([second], dtype=torch.int64))
+            allocator.withheld_pages = torch.tensor(
+                [second], dtype=torch.int64, device=allocator.device
+            )
+            allocator.free(indices)  # diverted to withheld_freed
+            allocator.withheld_pages = None
+            for ids in allocator.withheld_freed:
+                allocator.free_page_ids(ids)
+            allocator.withheld_freed = []
+        finally:
+            events.enabled = events_enabled
 
     def _start_streaming(self) -> None:
         tree_cache = self._tree_cache
@@ -616,14 +662,17 @@ class KvRestoreSession:
             if self._promoted_pages is None:
                 raise RuntimeError(f"[KvRestore] not a standby (mode {self._mode})")
             return self._promoted_pages, self._quarantine.page_count()
+        t0 = time.perf_counter()
         self._conn.settimeout(timeout_s)
         try:
             self._send({"type": "kv_promote"})
             reply = recv_msg(self._conn)
         except OSError as e:
             reply = {"status": f"error: {e}"}
+        t1 = time.perf_counter()
         if not _all_ranks(reply["status"] == "promoted"):
             raise RuntimeError(f"[KvRestore] promotion failed: {reply['status']}")
+        t2 = time.perf_counter()
         self._conn.settimeout(None)
         allocator = self._tree_cache.token_to_kv_pool_allocator
         allocator.free(self._held)
@@ -631,14 +680,23 @@ class KvRestoreSession:
         self._mode = "restore"
         self._promoted_pages = self._adopt(reply, grace_s=grace_s)
         self._start_streaming()
+        t3 = time.perf_counter()
+        logger.info(
+            f"[KvRestore] promoted in {(t3 - t0) * 1e3:.1f} ms: daemon "
+            f"{(t1 - t0) * 1e3:.1f}, rank agreement {(t2 - t1) * 1e3:.1f}, "
+            f"adopt {(t3 - t2) * 1e3:.1f}"
+        )
         return self._promoted_pages, self._quarantine.page_count()
 
     def _adopt(self, handover: Dict[str, Any], *, grace_s: float) -> int:
         """Import the agreed directory and start the quarantine of the
         predecessors' uncommitted pages; returns the number of adopted pages."""
+        t0 = time.perf_counter()
         entries = [tuple(e) for e in handover["directory"]]
         entries, live = _agree_across_tp(entries, handover["live"])
+        t1 = time.perf_counter()
         adopted_tokens = import_directory(self._tree_cache, entries, self._page_size)
+        t2 = time.perf_counter()
         gone = handover["writer_gone_s"]
         q = self._quarantine
         q.active = True
@@ -653,11 +711,15 @@ class KvRestoreSession:
                 target=self._read_notes, name="kv-restore-notes", daemon=True
             ).start()
         self._withdraw(set(live))
+        t3 = time.perf_counter()
         self._sync_state(all_gone=_all_ranks(q.old_gone))
         logger.info(
             f"[KvRestore] adopted {adopted_tokens // self._page_size} pages; "
             f"quarantined {q.page_count()}; predecessor "
-            f"{'gone' if q.old_gone else 'still connected (fenced)'}"
+            f"{'gone' if q.old_gone else 'still connected (fenced)'} "
+            f"(agree {(t1 - t0) * 1e3:.1f} ms, import {(t2 - t1) * 1e3:.1f} ms, "
+            f"quarantine {(t3 - t2) * 1e3:.1f} ms, "
+            f"final agreement {(time.perf_counter() - t3) * 1e3:.1f} ms)"
         )
         return adopted_tokens // self._page_size
 
@@ -842,6 +904,9 @@ class _Quarantine:
 # bounds how long a predecessor's late eviction stays reusable.
 _SYNC_INTERVAL_S = 0.1
 
+
+# Radix namespace of the warm-up pages; no request uses it.
+_WARM_UP_KEY = "__sglang_kv_restore_warm_up__"
 
 # A restarted writer cannot tell how long its predecessor's GPU work may
 # still run; arbitrary, matches the promotion default.

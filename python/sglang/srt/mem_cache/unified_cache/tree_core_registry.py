@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
+    if envs.SGLANG_WEIGHT_CACHE_KV_RESTORE.get():
+        # Its directory listens to per-node device stores/removes, which the
+        # Rust TreeCore keeps inside the extension.
+        return "weight cache KV restore requires the Python TreeCore"
     if params.tree_components is not None and set(params.tree_components) - {
         ComponentType.FULL,
         ComponentType.SWA,
