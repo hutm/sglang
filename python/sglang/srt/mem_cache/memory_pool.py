@@ -375,8 +375,14 @@ def _kv_buffer_alloc(memory_saver_adapter) -> Callable[..., torch.Tensor]:
     """Allocator for KV buffers created inside the KV cache region.
 
     Zero-fills unless the memory saver backend hands back memory that already
-    holds valid KV (``allocation_preserves_contents``).
+    holds valid KV (``allocation_preserves_contents``). With weight cache KV
+    restore, buffers come from (and are kept alive by) the daemon.
     """
+    from sglang.srt.weight_cache import kv_restore
+
+    session = kv_restore.current_session()
+    if session is not None:
+        return session.allocate
     if memory_saver_adapter.allocation_preserves_contents(GPU_MEMORY_TYPE_KV_CACHE):
         return torch.empty
     return torch.zeros

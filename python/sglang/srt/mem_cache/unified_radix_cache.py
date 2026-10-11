@@ -635,7 +635,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
-    def import_prefix(self, key: RadixKey, page_ids: torch.Tensor) -> int:
+    def import_prefix(
+        self, key: RadixKey, page_ids: torch.Tensor, cached_prefix_pages: int = 0
+    ) -> int:
         """Adopt KV that already sits in ``page_ids`` as a cached prefix.
 
         For KV produced outside this cache: memory that outlived a previous
@@ -645,6 +647,10 @@ class UnifiedRadixCache(BasePrefixCache):
         so they are evictable like any finished request's prefix; where the
         tree already caches part of ``key``, the insert frees the duplicate
         pages.
+
+        ``cached_prefix_pages`` leading pages were adopted by an earlier call
+        and are already in the tree; they are neither claimed again nor freed
+        as duplicates. This adopts a tree of prefixes one leaf at a time.
 
         Returns the number of tokens of ``key`` now cached, or 0 if the cache
         is disabled or any page is not free.
@@ -657,10 +663,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 f"key spans {len(key)} tokens but {int(page_ids.numel())} pages "
                 f"of {page_size} tokens were given"
             )
-        indices = self.token_to_kv_pool_allocator.alloc_pages(page_ids)
-        if indices is None:
+        allocator = self.token_to_kv_pool_allocator
+        new_indices = allocator.alloc_pages(page_ids[cached_prefix_pages:])
+        if new_indices is None:
             return 0
-        self.insert(InsertParams(key=key, value=indices))
+        cached_ids = page_ids[:cached_prefix_pages].to(new_indices.device)
+        offsets = torch.arange(page_size, dtype=torch.int64, device=new_indices.device)
+        cached_indices = (cached_ids[:, None] * page_size + offsets).reshape(-1)
+        self.insert(
+            InsertParams(
+                key=key,
+                value=torch.cat([cached_indices, new_indices]),
+                prev_prefix_len=cached_prefix_pages * page_size,
+            )
+        )
         return len(key)
 
     @rank_consensus(same_params=True, same_results=True)

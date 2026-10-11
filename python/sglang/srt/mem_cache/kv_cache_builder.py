@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip
+from sglang.srt.weight_cache import kv_restore
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -401,6 +402,12 @@ def build_kv_cache(
                 "UnifiedRadixCache with HiCache attached."
             )
         tree_cache.validate_retraction_host_capacity()
+
+    kv_restore_session = kv_restore.current_session()
+    if kv_restore_session is not None:
+        kv_restore_session.finish(
+            tree_cache, forward_stream=tp_worker.model_runner.forward_stream
+        )
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)

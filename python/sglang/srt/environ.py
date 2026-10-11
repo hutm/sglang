@@ -1920,6 +1920,10 @@ class Envs:
     # or "vmm_fd" (one exportable CUDA VMM allocation shared by POSIX fd; the
     # clients' mappings stay valid if the daemon exits).
     SGLANG_WEIGHT_CACHE_TRANSPORT = EnvStr("torch_ipc")
+    # Keep the engine's KV cache alive in the daemon across engine restarts:
+    # the next engine with the same weights and KV layout maps the same KV
+    # buffers and adopts the radix cache. Engine side only.
+    SGLANG_WEIGHT_CACHE_KV_RESTORE = EnvBool(False)
 
 
 envs = Envs()
