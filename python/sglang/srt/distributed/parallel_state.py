@@ -180,6 +180,11 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def get_registered_groups() -> List["GroupCoordinator"]:
+    """Live group coordinators in creation order, which is the same on every rank."""
+    return [group for ref in _groups.values() if (group := ref()) is not None]
+
+
 @register_custom_op(mutates_args=["tensor"])
 @register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
