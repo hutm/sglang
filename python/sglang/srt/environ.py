@@ -1916,6 +1916,10 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+    # Keep the engine's KV cache alive in the daemon across engine restarts:
+    # the next engine with the same weights and KV layout maps the same KV
+    # buffers and adopts the radix cache. Engine side only.
+    SGLANG_WEIGHT_CACHE_KV_RESTORE = EnvBool(False)
 
 
 envs = Envs()

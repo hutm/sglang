@@ -91,6 +91,9 @@ class KVCacheEventRecorder:
         self.dynamo_format = dynamo_format
         self.lora_names = lora_names if lora_names is not None else LoRANameTable()
         self._queue: list = []
+        # Notified of device stores/removes even when events are disabled,
+        # before a removed node's slots are freed (weight cache KV restore).
+        self.placement_listener: Optional[Any] = None
 
     def enqueue(self, event) -> None:
         """Append an event, coalescing it with a compatible queue tail.
@@ -164,10 +167,12 @@ class KVCacheEventRecorder:
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
         # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
-        if not self.enabled:
-            return
         if medium is None:
             medium = StorageMedium.GPU
+        if self.placement_listener is not None and medium == StorageMedium.GPU:
+            self.placement_listener.on_device_store(node)
+        if not self.enabled:
+            return
 
         event_hash_values = self._node_event_hash_values(node)
         namespace_seed = self._namespace_seed(node)
@@ -220,10 +225,12 @@ class KVCacheEventRecorder:
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
-        if not self.enabled:
-            return
         if medium is None:
             medium = StorageMedium.GPU
+        if self.placement_listener is not None and medium == StorageMedium.GPU:
+            self.placement_listener.on_device_remove(node)
+        if not self.enabled:
+            return
 
         # Hash values must match what was stored.
         event_hash_values = self._node_event_hash_values(node)
@@ -249,6 +256,8 @@ class KVCacheEventRecorder:
             self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
 
     def record_all_cleared(self) -> None:
+        if self.placement_listener is not None:
+            self.placement_listener.on_all_cleared()
         if not self.enabled:
             return
         self.enqueue(AllBlocksCleared())

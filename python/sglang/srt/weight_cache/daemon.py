@@ -42,6 +42,7 @@ import multiprocessing
 import os
 import signal
 import socket
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
@@ -59,6 +60,7 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 
+from .kv_restore import KvRestoreStore
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
@@ -188,6 +190,8 @@ class WeightCacheDaemon:
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
+        # Engine KV buffers and radix directory kept alive across engine restarts.
+        self.kv_store = KvRestoreStore()
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -533,8 +537,9 @@ class WeightCacheDaemon:
                     # (or dies mid-send) would block recv_msg forever and stall
                     # every other engine rank. Bound each exchange instead.
                     conn.settimeout(CLIENT_CONNECTION_TIMEOUT)
+                    handed_off = False
                     try:
-                        self._handle_connection(conn)
+                        handed_off = self._handle_connection(conn)
                     except Exception as e:
                         logger.error(
                             f"[WeightCacheDaemon gpu={self.gpu_id}] "
@@ -542,7 +547,8 @@ class WeightCacheDaemon:
                             exc_info=True,
                         )
                     finally:
-                        conn.close()
+                        if not handed_off:
+                            conn.close()
                 except socket.timeout:
                     continue
         finally:
@@ -553,9 +559,28 @@ class WeightCacheDaemon:
                 os.unlink(self.ready_path)
             logger.info(f"[WeightCacheDaemon gpu={self.gpu_id}] Shutdown complete")
 
-    def _handle_connection(self, conn: socket.socket):
-        """Handle a single client connection."""
+    def _handle_connection(self, conn: socket.socket) -> bool:
+        """Handle a single client connection. Returns True when a session
+        thread took ownership of ``conn``."""
         req = recv_msg(conn)
+
+        if req.get("type") == "kv_attach":
+            # The open connection is the engine's KV writer lease.
+            threading.Thread(
+                target=self.kv_store.serve_session,
+                args=(conn, req),
+                name=f"weight-cache-kv-session-{self.gpu_id}",
+                daemon=True,
+            ).start()
+            return True
+
+        if req.get("type") == "kv_status":
+            send_msg(conn, self.kv_store.status())
+            return False
+
+        if req.get("type") == "kv_drop":
+            send_msg(conn, self.kv_store.drop(force=bool(req.get("force"))))
+            return False
 
         if req.get("type") == "query_config":
             # Client asks for config without requesting handles
@@ -609,6 +634,7 @@ class WeightCacheDaemon:
                     "message": f"Unknown request type: {req.get('type')}",
                 },
             )
+        return False
 
     def shutdown(self):
         """Release GPU memory and clean up."""
@@ -618,6 +644,7 @@ class WeightCacheDaemon:
             del self.model
             self.model = None
         self.state_entries.clear()
+        self.kv_store.close()
         current_platform.empty_cache()
         self._running = False
 
