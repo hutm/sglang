@@ -746,7 +746,8 @@ class UnifiedRadixCache(BasePrefixCache):
             firsts.append(first)
             counts.append(0 if first is None else len(first))
         present = [f for f in firsts if f is not None and len(f)]
-        flat = (torch.cat(present) // self.page_size).tolist() if present else []
+        flat = torch.cat(present).tolist() if present else []
+        flat = [index // self.page_size for index in flat]
         pages_of, offset = {}, 0
         for node, count in zip(nodes, counts):
             pages_of[node.id] = flat[offset : offset + count]

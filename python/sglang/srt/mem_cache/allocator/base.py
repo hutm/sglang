@@ -225,19 +225,26 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def _alloc_pages_from_free_list(
         self, page_ids: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        """``alloc_pages`` for allocators that keep free pages in ``free_pages``."""
+        """``alloc_pages`` for allocators that keep free pages in ``free_pages``.
+
+        The membership checks run on the host on one copy of the free list:
+        on the device, isin and unique launch sort kernels whose first use
+        can take seconds in a process that has not run them yet (a warm
+        standby's first adoption)."""
         if self.free_group is not None:
             raise RuntimeError("cannot allocate specific pages inside a free group")
-        page_ids = page_ids.to(device=self.device, dtype=torch.int64).reshape(-1)
-        if page_ids.numel() == 0:
+        ids = page_ids.to(device="cpu", dtype=torch.int64).reshape(-1)
+        if ids.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
-        if torch.unique(page_ids).numel() != page_ids.numel():
+        if torch.unique(ids).numel() != ids.numel():
             return None
         self.merge_and_sort_free()
-        taken = torch.isin(self.free_pages, page_ids)
-        if int(taken.sum()) != page_ids.numel():
+        free = self.free_pages.cpu()
+        taken = torch.isin(free, ids)
+        if int(taken.sum()) != ids.numel():
             return None
-        self.free_pages = self.free_pages[~taken]
+        self.free_pages = free[~taken].to(self.device)
+        page_ids = ids.to(self.device)
         self._notify_allocated(page_ids)
         offsets = torch.arange(self.page_size, dtype=torch.int64, device=self.device)
         return (page_ids[:, None] * self.page_size + offsets).reshape(-1)
