@@ -1928,6 +1928,9 @@ class Envs:
     # "standby" maps the writer's pool without writing to it until an
     # orchestrator calls kv_restore_promote (warm standby on the same GPU).
     SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE = EnvStr("writer")
+    # Debugging: write a cProfile of each TP rank's scheduler thread, from the
+    # start of kv_restore_promote until its quarantine ends, into this directory.
+    SGLANG_WEIGHT_CACHE_KV_RESTORE_PROFILE_DIR = EnvStr(None)
 
 
 envs = Envs()

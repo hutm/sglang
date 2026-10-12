@@ -454,6 +454,7 @@ class KvRestoreSession:
         # Standby: every page, held so nothing writes into the writer's pool.
         self._held: Optional[torch.Tensor] = None
         self._promoted_pages: Optional[int] = None
+        self._profile = None  # see SGLANG_WEIGHT_CACHE_KV_RESTORE_PROFILE_DIR
         # Quarantine of pages a predecessor writer may still write: from
         # adoption until release, with daemon notes collected by a reader
         # thread and applied identically on every TP rank by sync().
@@ -677,6 +678,7 @@ class KvRestoreSession:
             if self._promoted_pages is None:
                 raise RuntimeError(f"[KvRestore] not a standby (mode {self._mode})")
             return self._promoted_pages, self._quarantine.page_count()
+        self._start_profile()
         t0 = time.perf_counter()
         self._conn.settimeout(timeout_s)
         try:
@@ -706,7 +708,7 @@ class KvRestoreSession:
     def _adopt(self, handover: Dict[str, Any], *, grace_s: float) -> int:
         """Import the agreed directory and start the quarantine of the
         predecessors' uncommitted pages; returns the number of adopted pages."""
-        tw = time.perf_counter()
+        tw, cpu0 = time.perf_counter(), time.thread_time()
         # Separates waiting for the GPU (e.g. a dying predecessor's context on
         # the same device) from the adoption's own work in the log below.
         device = torch.device(self._tree_cache.token_to_kv_pool_allocator.device)
@@ -741,8 +743,12 @@ class KvRestoreSession:
             f"(gpu wait {(t0 - tw) * 1e3:.1f} ms, agree {(t1 - t0) * 1e3:.1f} ms, "
             f"import {(t2 - t1) * 1e3:.1f} ms, "
             f"quarantine {(t3 - t2) * 1e3:.1f} ms, "
-            f"final agreement {(time.perf_counter() - t3) * 1e3:.1f} ms)"
+            f"final agreement {(time.perf_counter() - t3) * 1e3:.1f} ms; "
+            f"thread cpu {(time.thread_time() - cpu0) * 1e3:.1f} ms of "
+            f"{(time.perf_counter() - tw) * 1e3:.1f} ms)"
         )
+        if not q.active:
+            self._stop_profile()
         return adopted_tokens // self._page_size
 
     def _read_notes(self) -> None:
@@ -884,7 +890,31 @@ class KvRestoreSession:
             allocator.free_page_ids(ids)
         allocator.withheld_freed = []
         logger.info(f"[KvRestore] released {count} quarantined pages")
+        self._stop_profile()
         return count
+
+    def _start_profile(self) -> None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_WEIGHT_CACHE_KV_RESTORE_PROFILE_DIR.get():
+            import cProfile
+
+            self._profile = cProfile.Profile()
+            self._profile.enable()
+
+    def _stop_profile(self) -> None:
+        from sglang.srt.environ import envs
+
+        if self._profile is None:
+            return
+        self._profile.disable()
+        path = os.path.join(
+            envs.SGLANG_WEIGHT_CACHE_KV_RESTORE_PROFILE_DIR.get(),
+            f"kv_restore_promote.{socket.gethostname()}.{os.getpid()}.prof",
+        )
+        self._profile.dump_stats(path)
+        self._profile = None
+        logger.info(f"[KvRestore] promotion profile written to {path}")
 
     def needs_sync(self, now: float) -> bool:
         """Checked on the rank that pulls requests: a sync is due every
