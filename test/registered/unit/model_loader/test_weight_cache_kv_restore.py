@@ -142,6 +142,36 @@ def test_directory_tree_is_adopted_with_shared_prefixes():
         assert (path[::PAGE] // PAGE).tolist() == [3, 7, leaf]
 
 
+def test_directory_import_skips_only_the_leaves_with_a_taken_page():
+    # root -> 3 -> {5, 6}; page 6 is already in use, so only 3 -> 5 is adopted.
+    entries = [
+        (3, -1, tuple(_tokens(3)), None, None),
+        (5, 3, tuple(_tokens(5)), None, None),
+        (6, 3, tuple(_tokens(6)), None, None),
+    ]
+    allocator = _paged()
+    cache = _cache(allocator)
+    allocator.alloc_pages(torch.tensor([6]))
+    free_before = allocator.available_size()
+    assert kv_restore.import_directory(cache, entries, PAGE) == 2 * PAGE
+    assert allocator.available_size() == free_before - 2 * PAGE
+    assert 6 not in allocator.get_all_free_pages().tolist()
+
+
+def test_directory_import_returns_pages_of_duplicate_content():
+    # Two chains with the same tokens: the tree keeps one, the other's page
+    # goes back to the allocator.
+    entries = [
+        (3, -1, tuple(_tokens(3)), None, None),
+        (5, -1, tuple(_tokens(3)), None, None),
+    ]
+    allocator = _paged()
+    cache = _cache(allocator)
+    free_before = allocator.available_size()
+    kv_restore.import_directory(cache, entries, PAGE)
+    assert allocator.available_size() == free_before - PAGE
+
+
 class _FakeEvent:
     done = False
 

@@ -706,6 +706,12 @@ class KvRestoreSession:
     def _adopt(self, handover: Dict[str, Any], *, grace_s: float) -> int:
         """Import the agreed directory and start the quarantine of the
         predecessors' uncommitted pages; returns the number of adopted pages."""
+        tw = time.perf_counter()
+        # Separates waiting for the GPU (e.g. a dying predecessor's context on
+        # the same device) from the adoption's own work in the log below.
+        device = torch.device(self._tree_cache.token_to_kv_pool_allocator.device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         entries = [tuple(e) for e in handover["directory"]]
         entries, live = _agree_across_tp(entries, handover["live"])
@@ -732,7 +738,8 @@ class KvRestoreSession:
             f"[KvRestore] adopted {adopted_tokens // self._page_size} pages; "
             f"quarantined {q.page_count()}; predecessor "
             f"{'gone' if q.old_gone else 'still connected (fenced)'} "
-            f"(agree {(t1 - t0) * 1e3:.1f} ms, import {(t2 - t1) * 1e3:.1f} ms, "
+            f"(gpu wait {(t0 - tw) * 1e3:.1f} ms, agree {(t1 - t0) * 1e3:.1f} ms, "
+            f"import {(t2 - t1) * 1e3:.1f} ms, "
             f"quarantine {(t3 - t2) * 1e3:.1f} ms, "
             f"final agreement {(time.perf_counter() - t3) * 1e3:.1f} ms)"
         )
@@ -1012,13 +1019,46 @@ def import_directory(tree_cache, entries: List[PageEntry], page_size: int) -> in
     """Adopt a page directory into ``tree_cache``; returns the number of
     tokens adopted. Each leaf's root-to-leaf path is imported once, reusing
     the pages earlier leaves already adopted. Pages whose chain to the root
-    is incomplete are skipped."""
+    is incomplete are skipped. All pages are claimed in one allocator call
+    and copied to the device once, so the import does not sync per leaf."""
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
+    paths = _leaf_paths(entries)
+    if not paths:
+        return 0
+    allocator = tree_cache.token_to_kv_pool_allocator
+    pages = list(dict.fromkeys(e[0] for path in paths for e in path))
+    if allocator.alloc_pages(torch.tensor(pages, dtype=torch.int64)) is None:
+        return _import_paths_one_by_one(tree_cache, paths, page_size)
+    flat = torch.tensor([e[0] for path in paths for e in path], dtype=torch.int64).to(
+        allocator.device
+    )
+    adopted_pages: set = set()
+    adopted = offset = 0
+    for path in paths:
+        cached = 0
+        while cached < len(path) and path[cached][0] in adopted_pages:
+            cached += 1
+        page_ids = flat[offset : offset + len(path)]
+        offset += len(path)
+        tokens: List[int] = []
+        for e in path:
+            tokens.extend(e[2])
+        key = RadixKey(array("q", tokens), extra_key=path[0][3], cache_salt=path[0][4])
+        tree_cache.import_prefix(
+            key, page_ids, cached_prefix_pages=cached, claimed=True
+        )
+        adopted_pages.update(e[0] for e in path)
+        adopted += (len(path) - cached) * page_size
+    return adopted
+
+
+def _leaf_paths(entries: List[PageEntry]) -> List[List[PageEntry]]:
+    """Root-to-leaf page paths whose chain to the root is complete; a path
+    never repeats an earlier path's pages except as its leading prefix."""
     by_id = {e[0]: e for e in entries}
     has_child = {e[1] for e in entries}
-    adopted_pages: set = set()
-    adopted = 0
+    paths = []
     for leaf in by_id:
         if leaf in has_child:
             continue
@@ -1031,9 +1071,19 @@ def import_directory(tree_cache, entries: List[PageEntry], page_size: int) -> in
             seen.add(page_id)
             path.append(by_id[page_id])
             page_id = by_id[page_id][1]
-        if not path:
-            continue
-        path.reverse()
+        if path:
+            path.reverse()
+            paths.append(path)
+    return paths
+
+
+def _import_paths_one_by_one(tree_cache, paths, page_size: int) -> int:
+    """Fallback when some page is not free: claim per leaf, skip failures."""
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    adopted_pages: set = set()
+    adopted = 0
+    for path in paths:
         cached = 0
         while cached < len(path) and path[cached][0] in adopted_pages:
             cached += 1

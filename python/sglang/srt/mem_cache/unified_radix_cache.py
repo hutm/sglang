@@ -636,7 +636,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.buffer_pipeline.end_insert_walk()
 
     def import_prefix(
-        self, key: RadixKey, page_ids: torch.Tensor, cached_prefix_pages: int = 0
+        self,
+        key: RadixKey,
+        page_ids: torch.Tensor,
+        cached_prefix_pages: int = 0,
+        claimed: bool = False,
     ) -> int:
         """Adopt KV that already sits in ``page_ids`` as a cached prefix.
 
@@ -652,6 +656,10 @@ class UnifiedRadixCache(BasePrefixCache):
         and are already in the tree; they are neither claimed again nor freed
         as duplicates. This adopts a tree of prefixes one leaf at a time.
 
+        With ``claimed``, the caller already took the other pages from the
+        allocator (e.g. a whole tree's pages in one ``alloc_pages`` call), and
+        a ``page_ids`` on the cache's device makes the import sync-free.
+
         Returns the number of tokens of ``key`` now cached, or 0 if the cache
         is disabled or any page is not free.
         """
@@ -664,16 +672,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 f"of {page_size} tokens were given"
             )
         allocator = self.token_to_kv_pool_allocator
-        new_indices = allocator.alloc_pages(page_ids[cached_prefix_pages:])
-        if new_indices is None:
+        if (
+            not claimed
+            and allocator.alloc_pages(page_ids[cached_prefix_pages:]) is None
+        ):
             return 0
-        cached_ids = page_ids[:cached_prefix_pages].to(new_indices.device)
-        offsets = torch.arange(page_size, dtype=torch.int64, device=new_indices.device)
-        cached_indices = (cached_ids[:, None] * page_size + offsets).reshape(-1)
+        page_ids = page_ids.to(device=allocator.device, dtype=torch.int64)
+        offsets = torch.arange(page_size, dtype=torch.int64, device=page_ids.device)
         self.insert(
             InsertParams(
                 key=key,
-                value=torch.cat([cached_indices, new_indices]),
+                value=(page_ids[:, None] * page_size + offsets).reshape(-1),
                 prev_prefix_len=cached_prefix_pages * page_size,
             )
         )
@@ -695,18 +704,17 @@ class UnifiedRadixCache(BasePrefixCache):
         if not isinstance(self.tree_core, UnifiedTreeCore):
             return set(page_ids)
         full = BASE_COMPONENT_TYPE
+        nodes, stack = [], list(self.tree_core.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            nodes.append(node)
+            stack.extend(node.children.values())
+        pages_of = self._device_pages(nodes)
         targets = []
         stack = list(self.tree_core.root_node.children.values())
         while stack:
             node = stack.pop()
-            value = node.component_data[full].value
-            if (
-                value is not None
-                and len(value)
-                and not page_ids.isdisjoint(
-                    (value[:: self.page_size] // self.page_size).tolist()
-                )
-            ):
+            if not page_ids.isdisjoint(pages_of[node.id]):
                 targets.append(node)  # its subtree goes with it
                 continue
             stack.extend(node.children.values())
@@ -720,17 +728,30 @@ class UnifiedRadixCache(BasePrefixCache):
                 stack.extend(node.children.values())
             if any(cd.lock_ref > 0 for n in subtree for cd in n.component_data):
                 for n in subtree:
-                    value = n.component_data[full].value
-                    if value is not None:
-                        held.update(
-                            (value[:: self.page_size] // self.page_size).tolist()
-                        )
+                    held.update(pages_of[n.id])
                 continue
             # Children before parents, so each node is a device leaf when evicted.
             for node in reversed(subtree):
                 if node.component_data[full].value is not None:
                     self._evict_device_leaf(node.id, tracker)
         return held & page_ids
+
+    def _device_pages(self, nodes) -> dict[int, list[int]]:
+        """Page ids of each node's device value, read with a single transfer."""
+        full = BASE_COMPONENT_TYPE
+        firsts, counts = [], []
+        for node in nodes:
+            value = node.component_data[full].value
+            first = value[:: self.page_size] if value is not None else value
+            firsts.append(first)
+            counts.append(0 if first is None else len(first))
+        present = [f for f in firsts if f is not None and len(f)]
+        flat = (torch.cat(present) // self.page_size).tolist() if present else []
+        pages_of, offset = {}, 0
+        for node, count in zip(nodes, counts):
+            pages_of[node.id] = flat[offset : offset + count]
+            offset += count
+        return pages_of
 
     @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, params: EvictParams) -> EvictResult:

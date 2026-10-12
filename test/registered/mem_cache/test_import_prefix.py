@@ -111,6 +111,19 @@ def test_import_prefix_frees_pages_for_an_already_cached_prefix():
     assert 4 in allocator.get_all_free_pages().tolist()
 
 
+def test_import_prefix_of_claimed_pages_does_not_claim_them_again():
+    allocator = _paged()
+    cache = _cache(allocator)
+    allocator.alloc_pages(torch.tensor([2, 6]))
+    available = allocator.available_size()
+    key = RadixKey(list(range(2 * PAGE)))
+    assert cache.import_prefix(key, torch.tensor([2, 6]), claimed=True) == 2 * PAGE
+    assert allocator.available_size() == available
+    result = cache.match_prefix(MatchPrefixParams(key=key))
+    path = cache.path_device_indices(result.last_device_node)
+    assert (path[::PAGE] // PAGE).tolist() == [2, 6]
+
+
 def test_import_prefix_rejects_unavailable_pages_and_bad_keys():
     allocator = _paged()
     cache = _cache(allocator)
