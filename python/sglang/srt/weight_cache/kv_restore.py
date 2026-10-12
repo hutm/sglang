@@ -17,7 +17,8 @@ writer lease; only one engine writes to a pool at a time):
                       {"status": "fresh"} / {"status": "busy"}
     standby: daemon -> {"status": "standby", "buffers": [...], "token_capacity": n}
                        + fds (waits up to wait_s for a writer to deposit), or
-                       {"status": "mismatch"} / {"status": "timeout"}
+                       {"status": "mismatch"} / {"status": "timeout"} /
+                       {"status": "writer_failed"} (the last writer died mid-deposit)
     fresh:  engine -> {"type": "kv_deposit", "desc": desc} + fd   (per buffer)
             engine -> {"type": "kv_layout_done", "count": n, "token_capacity": t}
     writer: engine -> {"type": "kv_commit", "pages": [...]}
@@ -122,6 +123,9 @@ class KvRestoreStore:
     def __init__(self) -> None:
         self._cond = threading.Condition()
         self._pool: Optional[_KvPool] = None
+        # The last writer died before sealing its pool; until another writer
+        # attaches, standbys fail instead of waiting for a pool that never comes.
+        self._writer_failed = False
 
     def serve_session(self, conn: socket.socket, attach: Dict[str, Any]) -> None:
         """Run one engine's session until it disconnects. Owns ``conn``."""
@@ -163,6 +167,7 @@ class KvRestoreStore:
                 self._close_pool(pool)
             pool = _KvPool(key=key, writer=session)
             self._pool = pool
+            self._writer_failed = False
             send_msg(conn, {"status": "fresh"})
             return pool
 
@@ -175,6 +180,9 @@ class KvRestoreStore:
         deadline = time.monotonic() + attach.get("wait_s", 1800.0)
         with self._cond:
             while True:
+                if self._writer_failed:
+                    send_msg(conn, {"status": "writer_failed"})
+                    return None
                 pool = self._pool
                 if pool is not None and pool.complete:
                     if pool.key != key:
@@ -325,6 +333,7 @@ class KvRestoreStore:
             self._close_pool(pool)
             if self._pool is pool:
                 self._pool = None
+                self._writer_failed = True
         self._cond.notify_all()
 
     @staticmethod
@@ -493,6 +502,12 @@ class KvRestoreSession:
             self._mode = "off"
             return
         status = reply["status"]
+        if status == "writer_failed":
+            conn.close()
+            raise RuntimeError(
+                "[KvRestore] standby attach failed: the writer exited before its "
+                "KV pool was complete; see the writer engine's log for why"
+            )
         if status in ("mismatch", "timeout"):
             conn.close()
             raise RuntimeError(

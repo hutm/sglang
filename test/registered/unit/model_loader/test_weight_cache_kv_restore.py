@@ -455,3 +455,34 @@ def test_warm_up_leaves_the_allocator_and_tree_unchanged():
     assert sorted(allocator.get_all_free_pages().tolist()) == free_before
     assert allocator.withheld_pages is None and allocator.withheld_freed == []
     assert cache.tree_core.root_node.children == {}
+
+
+def test_waiting_standby_fails_when_the_writer_dies_mid_deposit():
+    # A writer crashing before its pool is complete (e.g. during CUDA graph
+    # capture) must not leave standbys waiting for a pool that never comes.
+    store = kv_restore.KvRestoreStore()
+    standby, standby_thread = _attach(store, "standby", wait_s=30)
+    writer, writer_thread = _attach(store, "writer")
+    assert recv_msg(writer) == {"status": "fresh"}
+    _deposit(writer, b"partial")
+    _end(writer, writer_thread)
+    assert recv_msg(standby) == {"status": "writer_failed"}
+    _end(standby, standby_thread)
+    store.close()
+
+
+def test_standby_attaching_after_a_failed_writer_fails_until_a_new_writer():
+    store = kv_restore.KvRestoreStore()
+    writer, writer_thread = _attach(store, "writer")
+    assert recv_msg(writer) == {"status": "fresh"}
+    _end(writer, writer_thread)
+    standby, standby_thread = _attach(store, "standby", wait_s=30)
+    assert recv_msg(standby) == {"status": "writer_failed"}
+    _end(standby, standby_thread)
+    writer, writer_thread = _attach(store, "writer")
+    assert recv_msg(writer) == {"status": "fresh"}
+    standby, standby_thread = _attach(store, "standby", wait_s=0.2)
+    assert recv_msg(standby) == {"status": "timeout"}
+    _end(standby, standby_thread)
+    _end(writer, writer_thread)
+    store.close()
