@@ -516,5 +516,31 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         self.assertIsNone(result)  # no real daemon at that socket -> absent
 
 
+def test_post_processed_entries_carry_their_pre_processing_layout():
+    # On SM100 the daemon's post-load processing requantizes block-FP8 scales
+    # to DeepGEMM's packed UE8M0 int32, so the exported tensor no longer has
+    # the shape/dtype of the client's meta model. The entry must carry the
+    # layout the client checks against, and the parameter's plain attributes
+    # (format_ue8m0) that the client's new Parameter would otherwise lose.
+    from torch import nn
+
+    from sglang.srt.weight_cache.daemon import _annotate_post_processed
+
+    scale = nn.Parameter(torch.zeros(4096, 2, dtype=torch.int32), requires_grad=False)
+    scale.format_ue8m0 = True
+    scale.weight_loader = print  # callables are not exported
+    weight = nn.Parameter(torch.zeros(8, 8, dtype=torch.float8_e4m3fn))
+    entries = {"w": {}, "w_scale": {}}
+    state = {"w": (weight, True), "w_scale": (scale, True)}
+    pre = {"w": ((8, 8), "float8_e4m3fn"), "w_scale": ((32, 8), "float32")}
+    relaid = _annotate_post_processed(
+        entries, state, pre, {"w": weight, "w_scale": scale}
+    )
+    assert relaid == 1
+    assert "pre_layout" not in entries["w"]
+    assert entries["w_scale"]["pre_layout"] == ((32, 8), "float32")
+    assert entries["w_scale"]["param_attrs"] == {"format_ue8m0": True}
+
+
 if __name__ == "__main__":
     unittest.main()
