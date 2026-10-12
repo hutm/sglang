@@ -188,6 +188,9 @@ class WeightCacheDaemon:
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
+        # module name -> plain attributes of a client's meta model, before
+        # post-load processing; see _post_processed_module_state.
+        self.pre_processing_attrs: Dict[str, Dict[str, Any]] = {}
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -370,6 +373,11 @@ class WeightCacheDaemon:
         )
         tic = time.perf_counter()
 
+        # Clients bind exported tensors to a meta-initialized model and skip
+        # post-load processing; record its module attributes before the load
+        # can mutate the quantization config.
+        self.pre_processing_attrs = _meta_module_attrs(model_config, load_config)
+
         # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
         loader = get_model_loader(load_config=load_config, model_config=model_config)
         self.model = loader.load_model(
@@ -452,8 +460,25 @@ class WeightCacheDaemon:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
+        # Plain module attributes post-load processing set, which a client
+        # (it skips that processing) would otherwise lack.
+        module_values, module_tensors, unexported = _post_processed_module_state(
+            self.model, self.pre_processing_attrs
+        )
+        for name, tensor in module_tensors.items():
+            state_tensors[name] = (tensor, False)
+        if unexported:
+            logger.warning(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] post-load processing set "
+                f"{len(unexported)} module attributes that cannot be exported; "
+                f"clients will lack them: {unexported[:10]}"
+            )
+
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        for name in module_tensors:
+            self.state_entries[name]["module_attr"] = True
+        _attach_module_values(self.state_entries, module_values)
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
@@ -468,6 +493,8 @@ class WeightCacheDaemon:
             f"Exported {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
             f"transport={self.transport_backend.name}, "
+            f"{sum(map(len, module_values.values())) + len(module_tensors)} "
+            f"module attributes set by post-load processing, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
@@ -884,6 +911,83 @@ def launch_weight_cache_daemons(
             f"Weight cache daemon (pid={exited.pid}) exited with code "
             f"{exited.exitcode}; terminated the remaining daemons."
         )
+
+
+def _meta_module_attrs(model_config, load_config) -> Dict[str, Dict[str, Any]]:
+    """Plain attributes of every module of the model as a client initializes
+    it on the meta device, before post-load processing."""
+    from sglang.srt.model_loader.loader import (
+        _get_quantization_config,
+        _initialize_model,
+    )
+    from sglang.srt.model_loader.utils import set_default_torch_dtype
+
+    quant_config = _get_quantization_config(model_config, load_config)
+    with set_default_torch_dtype(model_config.dtype), torch.device("meta"):
+        model = _initialize_model(model_config, load_config, quant_config)
+    return {
+        name: _plain_attrs(module)
+        for name, module in model.named_modules(remove_duplicate=False)
+    }
+
+
+# Instance attributes every nn.Module has; not model state.
+_MODULE_INTERNALS = frozenset(vars(torch.nn.Module()))
+_SIMPLE_TYPES = (bool, int, float, str, type(None))
+_MISSING = object()
+
+
+def _plain_attrs(module: torch.nn.Module) -> Dict[str, Any]:
+    return {k: v for k, v in vars(module).items() if k not in _MODULE_INTERNALS}
+
+
+def _post_processed_module_state(model, pre_attrs):
+    """Plain module attributes post-load processing added or changed:
+    (module -> {attr: simple value}, "module.attr" -> CUDA tensor, names of
+    attributes of other kinds that cannot be exported)."""
+    values: Dict[str, Dict[str, Any]] = {}
+    tensors: Dict[str, torch.Tensor] = {}
+    unexported = []
+    for name, module in model.named_modules():
+        before = pre_attrs.get(name, {})
+        for attr, value in _plain_attrs(module).items():
+            old = before.get(attr, _MISSING)
+            if isinstance(value, torch.Tensor):
+                if isinstance(old, torch.Tensor) and old.device.type != "meta":
+                    continue
+                if value.is_cuda:
+                    tensors[f"{name}.{attr}"] = value.detach()
+                else:
+                    unexported.append(f"{name}.{attr}")
+            elif isinstance(value, _SIMPLE_TYPES):
+                if (
+                    old is _MISSING
+                    or not isinstance(old, _SIMPLE_TYPES)
+                    or old != value
+                ):
+                    values.setdefault(name, {})[attr] = value
+            elif old is _MISSING:
+                unexported.append(f"{name}.{attr}")
+    return values, tensors, unexported
+
+
+def _attach_module_values(entries, module_values) -> None:
+    """Ride each module's simple attributes on one of its own tensor entries,
+    which the client binds on that module."""
+    owners = {}
+    for name in entries:
+        module_name = name.rpartition(".")[0]
+        if not entries[name].get("module_attr"):
+            owners.setdefault(module_name, name)
+    for module_name, attrs in module_values.items():
+        owner = owners.get(module_name)
+        if owner is None:
+            logger.warning(
+                f"[WeightCacheDaemon] module {module_name!r} has no exported "
+                f"tensor to carry its post-processing attributes {sorted(attrs)}"
+            )
+            continue
+        entries[owner]["module_attrs"] = attrs
 
 
 if __name__ == "__main__":
