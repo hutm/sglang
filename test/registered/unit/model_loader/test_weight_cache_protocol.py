@@ -544,3 +544,37 @@ def test_post_processed_entries_carry_their_pre_processing_layout():
     assert "pre_layout" not in entries["w"]
     assert entries["w_scale"]["pre_layout"] == ((32, 8), "float32")
     assert entries["w_scale"]["param_attrs"] == {"format_ue8m0": True}
+
+
+def test_module_attributes_set_by_post_load_processing_are_exported():
+    # Post-load processing also sets plain module attributes (e.g. FP8 MoE
+    # with the FlashInfer TRT-LLM runner sets _flashinfer_trtllm_gemm1_alpha,
+    # possibly None). A client skips that processing, so the daemon exports
+    # added/changed simple values on one of the module's own tensor entries and
+    # plain CUDA tensors as their own entries; unchanged ones are not exported.
+    from torch import nn
+
+    from sglang.srt.weight_cache import daemon
+
+    class Experts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = nn.Parameter(torch.zeros(2, 2))
+            self.num_local_experts = 2
+
+    model = nn.Module()
+    model.experts = Experts()
+    pre = {name: daemon._plain_attrs(m) for name, m in model.named_modules()}
+    model.experts._flashinfer_trtllm_gemm1_alpha = None
+    model.experts.num_local_experts = 2  # unchanged
+    model.experts.intermediate_pad = 64
+    model.experts.cpu_scratch = torch.zeros(1)  # not exportable
+    values, tensors, unexported = daemon._post_processed_module_state(model, pre)
+    assert values == {
+        "experts": {"_flashinfer_trtllm_gemm1_alpha": None, "intermediate_pad": 64}
+    }
+    assert tensors == {} and unexported == ["experts.cpu_scratch"]
+
+    entries = {"experts.w13_weight": {}}
+    daemon._attach_module_values(entries, values)
+    assert entries["experts.w13_weight"]["module_attrs"] == values["experts"]

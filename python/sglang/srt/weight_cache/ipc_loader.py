@@ -375,6 +375,14 @@ class IpcModelLoader(BaseModelLoader):
             imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
 
+            if entry.get("module_attr"):
+                # A plain tensor attribute post-load processing set.
+                module_name, _, attr = name.rpartition(".")
+                setattr(model.get_submodule(module_name), attr, imported_tensor)
+                imported_refs.append(imported_tensor)
+                imported_count += 1
+                continue
+
             if name in existing_names:
                 # Existing parameter/buffer — validate shape/dtype. A tensor the
                 # daemon's post-load processing re-laid out (e.g. block-FP8
@@ -402,9 +410,15 @@ class IpcModelLoader(BaseModelLoader):
             bound = self._set_module_tensor(
                 model, name, imported_tensor, is_param=is_param
             )
-            # Plain attributes post-load processing set on the parameter.
+            # Plain attributes post-load processing set on the parameter and
+            # on its module.
             for key, value in entry.get("param_attrs", {}).items():
                 setattr(bound, key, value)
+            module_attrs = entry.get("module_attrs")
+            if module_attrs:
+                module = model.get_submodule(name.rpartition(".")[0])
+                for key, value in module_attrs.items():
+                    setattr(module, key, value)
             imported_refs.append(imported_tensor)
             imported_count += 1
 
