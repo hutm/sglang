@@ -188,6 +188,9 @@ class WeightCacheDaemon:
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
+        # name -> (shape, dtype) of a client's meta model, before post-load
+        # processing; see _annotate_post_processed.
+        self.pre_processing_layout: Dict[str, Tuple[Tuple[int, ...], str]] = {}
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -370,6 +373,11 @@ class WeightCacheDaemon:
         )
         tic = time.perf_counter()
 
+        # Clients bind exported tensors to a meta-initialized model, whose
+        # layout is the one before post-load processing; record it before the
+        # load can mutate the quantization config.
+        self.pre_processing_layout = _meta_layout(model_config, load_config)
+
         # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
         loader = get_model_loader(load_config=load_config, model_config=model_config)
         self.model = loader.load_model(
@@ -454,6 +462,12 @@ class WeightCacheDaemon:
 
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        relaid = _annotate_post_processed(
+            self.state_entries,
+            state_tensors,
+            self.pre_processing_layout,
+            dict(self.model.named_parameters(remove_duplicate=False)),
+        )
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
@@ -468,6 +482,7 @@ class WeightCacheDaemon:
             f"Exported {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
             f"transport={self.transport_backend.name}, "
+            f"{relaid} re-laid out by post-load processing, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
@@ -884,6 +899,53 @@ def launch_weight_cache_daemons(
             f"Weight cache daemon (pid={exited.pid}) exited with code "
             f"{exited.exitcode}; terminated the remaining daemons."
         )
+
+
+def _meta_layout(model_config, load_config) -> Dict[str, Tuple[Tuple[int, ...], str]]:
+    """Shape and dtype of every parameter and buffer of the model as a client
+    initializes it on the meta device, before post-load processing."""
+    from sglang.srt.model_loader.loader import (
+        _get_quantization_config,
+        _initialize_model,
+    )
+    from sglang.srt.model_loader.utils import set_default_torch_dtype
+
+    quant_config = _get_quantization_config(model_config, load_config)
+    with set_default_torch_dtype(model_config.dtype), torch.device("meta"):
+        model = _initialize_model(model_config, load_config, quant_config)
+    tensors = list(model.named_parameters(remove_duplicate=False))
+    tensors += list(model.named_buffers())
+    return {name: (tuple(t.shape), _dtype_name(t.dtype)) for name, t in tensors}
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).replace("torch.", "")
+
+
+def _annotate_post_processed(entries, state_tensors, pre_layout, params) -> int:
+    """Mark entries whose layout post-load processing changed (e.g. block-FP8
+    scales requantized to DeepGEMM's packed UE8M0 int32 on SM100) with their
+    pre-processing layout, which a client checks its meta model against before
+    binding the processed tensor. Also export plain attributes set on
+    parameters (e.g. format_ue8m0), which a client's new Parameter would lose.
+    Returns how many entries were re-laid out."""
+    relaid = 0
+    for name, entry in entries.items():
+        tensor = state_tensors[name][0]
+        pre = pre_layout.get(name)
+        if pre is not None and pre != (tuple(tensor.shape), _dtype_name(tensor.dtype)):
+            entry["pre_layout"] = pre
+            relaid += 1
+        param = params.get(name)
+        if param is not None:
+            attrs = {
+                key: value
+                for key, value in vars(param).items()
+                if isinstance(value, (bool, int, float, str))
+            }
+            if attrs:
+                entry["param_attrs"] = attrs
+    return relaid
 
 
 if __name__ == "__main__":

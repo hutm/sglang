@@ -272,7 +272,7 @@ class IpcModelLoader(BaseModelLoader):
             logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
 
     @staticmethod
-    def _set_module_tensor(model, name, tensor, is_param=True):
+    def _set_module_tensor(model, name, tensor, is_param=True) -> torch.Tensor:
         """Replace or register a parameter/buffer in the model by its full dotted name.
 
         This is necessary because setting param.data on a meta-device tensor
@@ -294,6 +294,7 @@ class IpcModelLoader(BaseModelLoader):
             # is inference-only, so autograd must never write into it.
             new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
+            return new_param
         else:
             # register_buffer raises KeyError if the name already exists as a
             # parameter or plain attribute (not a buffer). This happens when
@@ -304,6 +305,7 @@ class IpcModelLoader(BaseModelLoader):
             elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
+            return tensor
 
     def _load_zero_copy_mode(
         self,
@@ -362,24 +364,35 @@ class IpcModelLoader(BaseModelLoader):
             is_param = entry.get("is_param", True)
 
             if name in existing_names:
-                # Existing parameter/buffer — validate shape/dtype
+                # Existing parameter/buffer — validate shape/dtype. A tensor the
+                # daemon's post-load processing re-laid out (e.g. block-FP8
+                # scales packed to UE8M0 int32 for DeepGEMM) is checked by the
+                # layout it had before processing, which the meta model has.
                 if name in existing_params:
                     ref_param = existing_params[name]
                 else:
                     ref_param = existing_buffers[name]
-                if (
-                    imported_tensor.shape != ref_param.shape
-                    or imported_tensor.dtype != ref_param.dtype
-                ):
+                expected = entry.get("pre_layout")
+                if expected is None:
+                    expected = (tuple(imported_tensor.shape), imported_tensor.dtype)
+                else:
+                    expected = (tuple(expected[0]), getattr(torch, expected[1]))
+                if (tuple(ref_param.shape), ref_param.dtype) != expected:
                     mismatched.append(
                         f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
+                        f"(before post-load processing {expected[0]}/{expected[1]}) "
                         f"vs model={ref_param.shape}/{ref_param.dtype}"
                     )
                     del imported_tensor
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            bound = self._set_module_tensor(
+                model, name, imported_tensor, is_param=is_param
+            )
+            # Plain attributes post-load processing set on the parameter.
+            for key, value in entry.get("param_attrs", {}).items():
+                setattr(bound, key, value)
             imported_refs.append(imported_tensor)
             imported_count += 1
 
