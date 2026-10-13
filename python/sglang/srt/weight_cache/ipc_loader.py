@@ -25,6 +25,7 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 
+from . import kv_restore
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
@@ -176,6 +177,11 @@ class IpcModelLoader(BaseModelLoader):
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
             f"total={time.perf_counter() - tic:.2f}s"
+        )
+        # KV the daemon holds for this engine is counted like preloaded weights:
+        # memory profiling ran while the daemon held it.
+        self.preloaded_weights_bytes += kv_restore.maybe_start_session(
+            socket_path=self.socket_path, cache_config=cache_data["config"]
         )
 
         return model.eval()
