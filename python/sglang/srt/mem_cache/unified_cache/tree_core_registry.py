@@ -48,6 +48,10 @@ NATIVE_SLOTS = {"FULL": TREE_TOKEN, "SWA": TREE_WINDOW, "MAMBA": TREE_STATE}
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
+    if envs.SGLANG_WEIGHT_CACHE_KV_RESTORE.get():
+        # Its directory listens to per-node device stores/removes, which the
+        # Rust TreeCore keeps inside the extension.
+        return "weight cache KV restore requires the Python TreeCore"
     if params.tree_slots is not None and any(
         NATIVE_SLOTS.get(slot.component) != slot.family for slot in params.tree_slots
     ):

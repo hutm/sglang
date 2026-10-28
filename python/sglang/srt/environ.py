@@ -2382,6 +2382,16 @@ class Envs:
     # or "vmm_fd" (one exportable CUDA VMM allocation shared by POSIX fd; the
     # clients' mappings stay valid if the daemon exits).
     SGLANG_WEIGHT_CACHE_TRANSPORT = EnvStr("torch_ipc")
+    # Keep the engine's KV cache alive in the daemon across engine restarts:
+    # the next engine with the same weights and KV layout maps the same KV
+    # buffers and adopts the radix cache. Engine side only.
+    SGLANG_WEIGHT_CACHE_KV_RESTORE = EnvBool(False)
+    # Daemon side, with KV restore: the next engine may write the pool only
+    # once the previous writer's process exited, which the daemon watches via
+    # a pidfd. When it cannot see that process (the engine runs in another PID
+    # namespace; share it, e.g. hostPID or one pod), it waits this long after
+    # the writer disconnected instead.
+    SGLANG_WEIGHT_CACHE_KV_RESTORE_UNKNOWN_WRITER_GRACE_S = EnvFloat(2.0)
 
 
 envs = Envs()

@@ -124,6 +124,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_npu,
 )
+from sglang.srt.weight_cache import kv_restore
 
 logger = logging.getLogger(__name__)
 
@@ -2916,6 +2917,9 @@ class KVCacheConfigurator:
             distributed=get_parallel().launch_world_size > 1,
             cpu_group=get_parallel().world_group.cpu_group,
         )
+        # A restored KV pool is held by the weight cache daemon, not free, but
+        # this engine maps it as its KV cache instead of allocating new memory.
+        available_gpu_memory += kv_restore.restored_bytes() / (1 << 30)
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
         # Every prefill batch fits a captured bucket when batches are capped at the
@@ -3027,6 +3031,12 @@ class KVCacheConfigurator:
                     f"{token_capacity}. Use the profiled value instead."
                 )
             token_capacity = min(token_capacity, user_limit)
+
+        # A restored KV pool (weight cache KV restore) caps the capacity: the
+        # engine maps its existing buffers and must not outgrow them.
+        restored = kv_restore.restored_token_capacity()
+        if restored is not None:
+            token_capacity = min(token_capacity, restored)
 
         # Sync across PP ranks (each may have different layer counts)
         if get_parallel().pp_size > 1:
