@@ -2386,12 +2386,10 @@ class Envs:
     # the next engine with the same weights and KV layout maps the same KV
     # buffers and adopts the radix cache. Engine side only.
     SGLANG_WEIGHT_CACHE_KV_RESTORE = EnvBool(False)
-    # Daemon side, with KV restore: the next engine may write the pool only
-    # once the previous writer's process exited, which the daemon watches via
-    # a pidfd. When it cannot see that process (the engine runs in another PID
-    # namespace; share it, e.g. hostPID or one pod), it waits this long after
-    # the writer disconnected instead.
-    SGLANG_WEIGHT_CACHE_KV_RESTORE_UNKNOWN_WRITER_GRACE_S = EnvFloat(2.0)
+    # With KV restore: "writer" restores or deposits the pool and serves;
+    # "standby" maps the writer's pool without writing to it until an
+    # orchestrator calls kv_restore_promote (warm standby on the same GPU).
+    SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE = EnvStr("writer")
 
 
 envs = Envs()

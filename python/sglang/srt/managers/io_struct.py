@@ -2263,6 +2263,37 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class KvRestorePromoteReqInput(BaseReq, kw_only=True):
+    """Promote a weight cache KV restore standby to the pool's writer."""
+
+    # Bounds the exchange with the daemon; promotion never waits for the old
+    # writer, it fences it.
+    timeout_s: float
+    # Pages the fenced old writer may still write stay unallocatable until
+    # this long after its daemon session ended.
+    quarantine_grace_s: float = 2.0
+
+
+class KvRestorePromoteReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    adopted_pages: int = 0
+    quarantined_pages: int = 0
+
+
+class KvRestoreReleaseQuarantineReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class KvRestoreSyncReqInput(BaseReq, kw_only=True):
+    """Internal: TP ranks apply the daemon's notes on fenced predecessors and
+    release an expired quarantine in the same step."""
+
+
+class KvRestoreReleaseQuarantineReqOutput(BaseReq, kw_only=True):
+    released_pages: int
+
+
 class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     """Open a weight-update session: restore in-place-packed weights so new ones can load."""
 

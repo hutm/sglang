@@ -77,6 +77,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         # None: free right away. A list: hold frees until free_group_end().
         self.free_group: list[torch.Tensor] | None = None
+        # Told which pages are allocated and released (weight cache KV
+        # restore); on_pages_allocated runs before the KV is written.
+        self.page_listener = None
+        # Pages kept out of the free list when released (weight cache KV
+        # restore quarantine): they collect in withheld_freed instead.
+        self.withheld_pages: Optional[torch.Tensor] = None
+        self.withheld_freed: list[torch.Tensor] = []
 
     @property
     def size_full(self):
@@ -301,8 +308,31 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return None
         self.free_pages = free[~taken].to(self.device)
         page_ids = ids.to(self.device)
+        self._notify_allocated(page_ids)
         offsets = torch.arange(self.page_size, dtype=torch.int64, device=self.device)
         return (page_ids[:, None] * self.page_size + offsets).reshape(-1)
+
+    def _notify_allocated(self, page_ids: torch.Tensor) -> None:
+        if self.page_listener is not None and page_ids.numel():
+            self.page_listener.on_pages_allocated(page_ids)
+
+    def _notify_released(self, page_ids: torch.Tensor) -> None:
+        if self.page_listener is not None and page_ids.numel():
+            self.page_listener.on_pages_released(page_ids)
+
+    def _divert_withheld(self, page_ids: torch.Tensor) -> torch.Tensor:
+        """Drop withheld pages from a release, keeping them in withheld_freed."""
+        if self.withheld_pages is None or page_ids.numel() == 0:
+            return page_ids
+        withheld = torch.isin(page_ids, self.withheld_pages)
+        if bool(withheld.any()):
+            self.withheld_freed.append(page_ids[withheld])
+            page_ids = page_ids[~withheld]
+        return page_ids
+
+    def _notify_cleared(self) -> None:
+        if self.page_listener is not None:
+            self.page_listener.on_pages_cleared()
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:

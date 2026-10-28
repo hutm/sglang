@@ -801,6 +801,68 @@ class UnifiedRadixCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
+    def evict_pages(self, page_ids: set[int]) -> set[int]:
+        """Evict the device nodes holding any of ``page_ids``, with their
+        subtrees, e.g. pages another process may still write (weight cache KV
+        restore). Returns the pages left in the tree because a request locks
+        their subtree, or all of them when the tree core is not walkable."""
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+            UnifiedTreeCore,
+        )
+
+        if not isinstance(self.tree_core, UnifiedTreeCore):
+            return set(page_ids)
+        full = BASE_COMPONENT_TYPE
+        nodes, stack = [], list(self.tree_core.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            nodes.append(node)
+            stack.extend(node.children.values())
+        pages_of = self._device_pages(nodes)
+        targets = []
+        stack = list(self.tree_core.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            if not page_ids.isdisjoint(pages_of[node.id]):
+                targets.append(node)  # its subtree goes with it
+                continue
+            stack.extend(node.children.values())
+        held: set[int] = set()
+        tracker = {ct: 0 for ct in self.tree_components}
+        for target in targets:
+            subtree, stack = [], [target]
+            while stack:
+                node = stack.pop()
+                subtree.append(node)
+                stack.extend(node.children.values())
+            if any(cd.lock_ref > 0 for n in subtree for cd in n.component_data):
+                for n in subtree:
+                    held.update(pages_of[n.id])
+                continue
+            # Children before parents, so each node is a device leaf when evicted.
+            for node in reversed(subtree):
+                if node.component_data[full].value is not None:
+                    self._evict_device_leaf(node.id, tracker)
+        return held & page_ids
+
+    def _device_pages(self, nodes) -> dict[int, list[int]]:
+        """Page ids of each node's device value, read with a single transfer."""
+        full = BASE_COMPONENT_TYPE
+        firsts, counts = [], []
+        for node in nodes:
+            value = node.component_data[full].value
+            first = value[:: self.page_size] if value is not None else value
+            firsts.append(first)
+            counts.append(0 if first is None else len(first))
+        present = [f for f in firsts if f is not None and len(f)]
+        flat = torch.cat(present).tolist() if present else []
+        flat = [index // self.page_size for index in flat]
+        pages_of, offset = {}, 0
+        for node, count in zip(nodes, counts):
+            pages_of[node.id] = flat[offset : offset + count]
+            offset += count
+        return pages_of
+
     @rank_consensus(
         same_params=["params", "allocation_reclaim_satisfied is not None"],
         same_results=True,

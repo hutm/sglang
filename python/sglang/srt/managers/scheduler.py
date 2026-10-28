@@ -171,6 +171,9 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    KvRestorePromoteReqInput,
+    KvRestoreReleaseQuarantineReqInput,
+    KvRestoreSyncReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -414,6 +417,7 @@ from sglang.srt.utils.hf_transformers import (
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
+from sglang.srt.weight_cache import kv_restore
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -1969,6 +1973,12 @@ class Scheduler(
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
                 ),
+                (KvRestorePromoteReqInput, kv_restore.handle_promote),
+                (
+                    KvRestoreReleaseQuarantineReqInput,
+                    kv_restore.handle_release_quarantine,
+                ),
+                (KvRestoreSyncReqInput, kv_restore.handle_sync),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
