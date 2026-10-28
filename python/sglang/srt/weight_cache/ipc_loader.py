@@ -169,9 +169,15 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
-        # The model now points into the daemon's GPU memory via CUDA IPC. If the
-        # daemon dies, those pointers dangle, so watch it and fail loud.
-        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
+        # The model now points into the daemon's GPU memory. With CUDA IPC the
+        # pointers dangle if the daemon dies, so watch it and fail loud.
+        if self._transport_backend.mappings_outlive_exporter:
+            logger.info(
+                f"[IpcModelLoader] {self._transport_backend.name} mappings hold "
+                "their own reference; not watching the daemon's liveness"
+            )
+        else:
+            self._start_daemon_liveness_watchdog(cache_data.get("pid"))
 
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
