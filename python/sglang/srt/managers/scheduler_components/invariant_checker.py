@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     raise_error_or_warn,
 )
 from sglang.srt.utils.watchdog import WatchdogRaw
+from sglang.srt.weight_cache import kv_restore
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -111,7 +112,11 @@ class SchedulerInvariantChecker:
         # The token sub-pool's capacity as the stats report it: the sized cap
         # with a window, the schedulable token count with state.
         total = ps.full_capacity
-        session_held = self.pool_stats_observer.session_held_tokens()
+        # Pages a warm standby holds for a restored KV cache count like
+        # session-held pages.
+        session_held = (
+            self.pool_stats_observer.session_held_tokens() + kv_restore.held_tokens()
+        )
         if ps.is_hybrid_swa or ps.is_hybrid_ssm:
             protected = self.tree_cache.full_protected_size()
         else:

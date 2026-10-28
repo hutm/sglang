@@ -1884,6 +1884,30 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
 
+    def kv_restore_promote(
+        self, timeout_s: float, quarantine_grace_s: float = 2.0
+    ) -> int:
+        """Promote a weight cache KV restore standby
+        (SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE=standby) to the pool's writer.
+
+        Does not wait for the old writer: the daemon revokes its lease (it may
+        be frozen rather than dead) and this engine adopts the committed radix
+        cache. Pages the old writer may still write are quarantined until
+        quarantine_grace_s after its daemon session ended, or until
+        kv_restore_release_quarantine(). timeout_s bounds the daemon exchange.
+        Returns the number of adopted cached pages. Idempotent.
+        """
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.kv_restore_promote(timeout_s, quarantine_grace_s)
+        )
+
+    def kv_restore_release_quarantine(self) -> int:
+        """Release the old writer's quarantined pages before the grace ends;
+        returns the number released."""
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.kv_restore_release_quarantine()
+        )
+
     def freeze_gc(self):
         """
         To maintain a high performance server with low latency, we want to reduce the

@@ -136,6 +136,85 @@ class TestWeightCacheKvRestore(CustomTestCase):
             f"restored={restored[0][1]} restore_off={cold[0][1]}"
         )
 
+    def test_standby_promotes_while_the_writer_is_frozen(self):
+        # A standby on the same GPU maps the writer's weights and KV pool
+        # without copies. The writer is frozen (SIGSTOP), as a rank stuck in a
+        # collective would be: its daemon session never ends. Promotion must
+        # not wait for it, the standby answers from the writer's radix cache,
+        # and the quarantine ends once the frozen writer finally dies.
+        import signal
+
+        import psutil
+
+        import sglang as sgl
+        from sglang.srt.utils import kill_process_tree
+
+        writer = self._launch(restore=True)
+        writer_procs = [psutil.Process(writer.pid)]
+        writer_procs += writer_procs[0].children(recursive=True)
+        try:
+            first = [self._generate(p) for p in PROMPTS]
+            time.sleep(1)  # let the last commits reach the daemon
+
+            env = {
+                "SGLANG_WEIGHT_CACHE_KV_RESTORE": "1",
+                "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE": "standby",
+            }
+            saved = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            free_before = torch.cuda.mem_get_info()[0]
+            try:
+                standby = sgl.Engine(
+                    model_path=MODEL,
+                    weight_cache_mode="client",
+                    mem_fraction_static=0.3,
+                    log_level="info",
+                )
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k)
+                    else:
+                        os.environ[k] = v
+            standby_bytes = free_before - torch.cuda.mem_get_info()[0]
+
+            for proc in writer_procs:
+                proc.send_signal(signal.SIGSTOP)
+            try:
+                started = time.time()
+                adopted = standby.kv_restore_promote(10, quarantine_grace_s=0.5)
+                promote_s = time.time() - started
+                params = {"temperature": 0, "max_new_tokens": 16}
+                served = [standby.generate(p, params) for p in PROMPTS]
+            finally:
+                kill_process_tree(writer.pid)  # SIGKILL ends its session
+            time.sleep(2.0)  # EOF reaches the standby, then the grace runs
+            released_late = standby.kv_restore_release_quarantine()
+        finally:
+            if writer.poll() is None:
+                kill_process_tree(writer.pid)
+        standby.shutdown()
+
+        self.assertGreater(adopted, 0)
+        self.assertLess(promote_s, 5.0)
+        self.assertGreater(served[0]["meta_info"]["cached_tokens"], len(PREFIX) // 8)
+        for (text, _), out in zip(first, served):
+            self.assertEqual(text, out["text"])
+        # No second weights or KV pool: the standby adds far less than its
+        # 0.3 x GPU static budget (context, activations and graphs only).
+        total = torch.cuda.mem_get_info()[1]
+        self.assertLess(standby_bytes, 0.1 * total)
+        self.assertEqual(released_late, 0)  # released by itself after the grace
+        self.daemon_log.seek(0)
+        daemon_log = self.daemon_log.read()
+        # The writer was still connected (fenced), not dead, at promotion.
+        self.assertIn("1 fenced writers still connected", daemon_log)
+        print(
+            f"standby added {standby_bytes / 2**30:.2f} GiB; promote with a "
+            f"frozen writer {promote_s:.3f}s adopted {adopted} pages; first "
+            f"cached tokens {served[0]['meta_info']['cached_tokens']}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

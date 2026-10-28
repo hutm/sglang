@@ -14,6 +14,7 @@ from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state import (
     _tag_groups_for_flashinfer_allreduce_only,
     get_default_distributed_backend,
+    get_registered_groups,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -156,8 +157,15 @@ def init_parallel_runtime(
     )
 
     # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
-    # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
-    if get_exec().comm.pre_warm_nccl and (
+    # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs). A weight
+    # cache KV restore standby always pre-warms: it cannot run a warmup request
+    # (it holds every KV page), and its first request is a failover's.
+    kv_restore_standby = (
+        device == "cuda"
+        and envs.SGLANG_WEIGHT_CACHE_KV_RESTORE.get()
+        and envs.SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE.get() == "standby"
+    )
+    if (get_exec().comm.pre_warm_nccl or kv_restore_standby) and (
         parallel.tp_size > 1 or parallel.pp_size > 1 or parallel.moe_ep_size > 1
     ):
         _prewarm_nccl()
@@ -349,20 +357,38 @@ def init_layer_runtime(*, model_config: ModelConfig) -> None:
 
 
 def _prewarm_nccl() -> None:
+    """Create and connect every group's communicators now: created or
+    connected at first use, they cost seconds across many nodes."""
     parallel = get_parallel()
     warmup_start = time.perf_counter()
-    tp_group_handle = get_tp_group().device_group
+    groups = [g for g in get_registered_groups() if g.world_size > 1]
+    # Coordinators can share one device group.
+    device_groups = {id(g.device_group): g.device_group for g in groups}
 
-    # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
+    # Eager collectives that fall back to torch.distributed use the device group.
     warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
-    dist.all_reduce(warmup_tensor, group=tp_group_handle)
+    for device_group in device_groups.values():
+        dist.all_reduce(warmup_tensor, group=device_group)
+    # The model's collectives go through each coordinator, which may pick its
+    # own communicator (e.g. pynccl); NCCL connects each algorithm, picked by
+    # collective and message size, at first use.
+    for numel in (1 << 10, 1 << 16, 1 << 20):
+        for group in groups:
+            shard = torch.zeros(
+                numel, dtype=torch.bfloat16, device=torch.cuda.current_device()
+            )
+            full = shard.new_zeros(numel * group.world_size)
+            group.all_reduce(full)
+            group.all_gather_into_tensor(full, shard)
+            group.reduce_scatter_tensor(shard, full)
+    del warmup_tensor, shard, full
     current_platform.synchronize()
 
     warmup_elapsed = time.perf_counter() - warmup_start
     logger.info(
-        f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
-        f"(tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
-        f"ep_size={parallel.moe_ep_size})"
+        f"NCCL/RCCL/HCCL warmup of {len(device_groups)} groups completed in "
+        f"{warmup_elapsed:.3f}s (tp_size={parallel.tp_size}, "
+        f"pp_size={parallel.pp_size}, ep_size={parallel.moe_ep_size})"
     )
 
 
